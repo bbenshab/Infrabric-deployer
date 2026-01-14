@@ -1,0 +1,126 @@
+---
+# This ConfigMap contains the DaemonSet template that will be dynamically
+# populated with discovered SR-IOV networks by the test coordinator Job
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: network-perf-test-daemonset-template
+  namespace: default
+data:
+  daemonset.yaml: |
+    apiVersion: apps/v1
+    kind: DaemonSet
+    metadata:
+      name: network-perf-test-worker
+      namespace: default
+      labels:
+        app: network-perf-test
+    spec:
+      selector:
+        matchLabels:
+          app: network-perf-test-worker
+      template:
+        metadata:
+          labels:
+            app: network-perf-test-worker
+          annotations:
+            # This will be replaced with auto-discovered SR-IOV networks
+            k8s.v1.cni.cncf.io/networks: "SRIOV_NETWORKS_PLACEHOLDER"
+        spec:
+          affinity:
+            nodeAffinity:
+              requiredDuringSchedulingIgnoredDuringExecution:
+                nodeSelectorTerms:
+                - matchExpressions:
+                  - key: node-role.kubernetes.io/worker
+                    operator: Exists
+                  - key: node-role.kubernetes.io/master
+                    operator: DoesNotExist
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+          hostNetwork: false
+          containers:
+          - name: perf-test
+            image: quay.io/bbenshab/perf-test:universal
+            imagePullPolicy: Always
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              # Check if running custom pre-built image or base image
+              if [ -f /usr/local/bin/detect-gpu.sh ]; then
+                echo "Using pre-built image with tools already installed"
+                /usr/local/bin/detect-gpu.sh
+              else
+                echo "Using base image, installing tools..."
+                apt-get update -qq && apt-get install -y -qq perftest infiniband-diags iproute2 > /dev/null 2>&1 || true
+
+                if [ ! -f /opt/nccl-tests/build/all_reduce_perf ]; then
+                  echo "Installing nccl-tests..."
+                  apt-get install -y -qq git make > /dev/null 2>&1
+                  mkdir -p /opt
+                  cd /opt
+                  git clone https://github.com/NVIDIA/nccl-tests.git
+                  cd nccl-tests
+                  make MPI=0 CUDA_HOME=/usr/local/cuda
+                fi
+
+                echo "========================================="
+                echo "Network Performance Test Worker Ready"
+                echo "========================================="
+                echo "Node: $(hostname)"
+                echo "Available tools:"
+                which ib_write_bw || echo "  ib_write_bw: NOT FOUND"
+                echo ""
+                echo "Checking RDMA devices:"
+                ibv_devices || echo "  No RDMA devices found"
+                echo ""
+                echo "Network interfaces:"
+                ip -br addr show 2>/dev/null || echo "  ip command not available"
+                echo ""
+              fi
+
+              echo "Waiting for test coordinator..."
+              sleep infinity
+            env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            # NCCL environment variables for multi-node GPU communication
+            - name: NCCL_SOCKET_IFNAME
+              value: "net1,net2"
+            - name: NCCL_IB_HCA
+              value: "mlx5_2,mlx5_3"
+            - name: NCCL_NET_GDR_LEVEL
+              value: "5"
+            - name: NCCL_DEBUG
+              value: "WARN"
+            - name: NCCL_DEBUG_SUBSYS
+              value: "INIT,NET"
+            readinessProbe:
+              exec:
+                command:
+                - /bin/bash
+                - -c
+                - |
+                  command -v ib_write_bw > /dev/null && \
+                  ([ -f /opt/nccl-tests/build/all_reduce_perf ] || [ -f /workspace/nccl-tests/build/all_reduce_perf ])
+              initialDelaySeconds: 60
+              periodSeconds: 10
+              timeoutSeconds: 5
+              failureThreshold: 30
+            resources:
+              requests:
+                nvidia.com/gpu: 1
+                memory: "8Gi"
+                cpu: "4"
+              limits:
+                nvidia.com/gpu: 1
+                memory: "16Gi"
+                cpu: "8"
+            securityContext:
+              capabilities:
+                add:
+                - IPC_LOCK
+                - SYS_RESOURCE

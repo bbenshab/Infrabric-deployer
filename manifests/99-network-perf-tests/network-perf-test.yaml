@@ -1,0 +1,1287 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: network-perf-test
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: network-perf-test
+rules:
+- apiGroups: [""]
+  resources: ["pods", "nodes", "configmaps"]
+  verbs: ["get", "list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
+- apiGroups: ["apps"]
+  resources: ["daemonsets"]
+  verbs: ["get", "list", "create", "delete", "patch", "update"]
+- apiGroups: ["sriovnetwork.openshift.io"]
+  resources: ["sriovnetworks"]
+  verbs: ["get", "list"]
+- apiGroups: ["route.openshift.io"]
+  resources: ["routes"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: network-perf-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: network-perf-test
+subjects:
+- kind: ServiceAccount
+  name: network-perf-test
+  namespace: default
+---
+---
+# DaemonSet is created dynamically by the Job below after auto-discovering SR-IOV networks
+# Template stored in daemonset-template.yaml ConfigMap
+---
+# Job to coordinate and run the tests
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: network-perf-test
+  namespace: default
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: network-perf-test
+      restartPolicy: Never
+      containers:
+      - name: test-coordinator
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: report-scripts
+          mountPath: /opt/report-generator
+          readOnly: true
+        env:
+        - name: CLEANUP_WORKERS
+          value: "false"  # Set to "false" to keep worker pods running after tests
+        - name: KEEP_COORDINATOR_ALIVE
+          value: "true"  # Set to "true" to keep coordinator pod running (sleep infinity) for debugging
+        command:
+        - /bin/bash
+        - -c
+        - |
+          # Capture all output to file for report generation
+          exec > >(tee /tmp/test-output.log) 2>&1
+
+          set -e
+
+          # Color definitions
+          CYAN='\033[1;36m'
+          GREEN='\033[1;32m'
+          YELLOW='\033[1;33m'
+          BLUE='\033[1;34m'
+          MAGENTA='\033[1;35m'
+          RED='\033[1;31m'
+          BOLD='\033[1m'
+          RESET='\033[0m'
+
+          # Ensure jq is available for NCCL JSON parsing
+          if ! command -v jq &> /dev/null; then
+            echo "Installing jq..."
+            microdnf install -y jq >/dev/null 2>&1 || yum install -y jq >/dev/null 2>&1 || true
+            echo "✓ jq installed"
+          fi
+
+          echo -e "${CYAN}==========================================="
+          echo -e "Network Performance Testing"
+          echo -e "===========================================${RESET}"
+          echo ""
+
+          echo -e "${BLUE}Step 1: Discovering SR-IOV networks...${RESET}"
+          SRIOV_NETWORKS=$(oc get sriovnetwork -n openshift-sriov-network-operator -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || echo "")
+          
+          if [ -z "$SRIOV_NETWORKS" ]; then
+            echo "ERROR: No SR-IOV networks found in cluster"
+            echo "Please ensure SR-IOV operator is deployed and networks are configured"
+            exit 1
+          fi
+
+          echo "Found SR-IOV networks: $SRIOV_NETWORKS"
+          
+          # Build network annotation (default/<network-name>,default/<network-name>...)
+          NETWORK_ANNOTATION=""
+          for net in $SRIOV_NETWORKS; do
+            if [ -z "$NETWORK_ANNOTATION" ]; then
+              NETWORK_ANNOTATION="default/${net}"
+            else
+              NETWORK_ANNOTATION="${NETWORK_ANNOTATION},default/${net}"
+            fi
+          done
+          
+          echo "Network annotation: $NETWORK_ANNOTATION"
+          echo ""
+
+          echo -e "${BLUE}Step 2: Creating DaemonSet with discovered networks...${RESET}"
+          # Get template and replace placeholder
+          oc get configmap network-perf-test-daemonset-template -n default -o jsonpath='{.data.daemonset\.yaml}' |             sed "s|SRIOV_NETWORKS_PLACEHOLDER|$NETWORK_ANNOTATION|" |             oc apply -f - 2>/dev/null
+          
+          echo -e "${GREEN}✓ DaemonSet created with SR-IOV networks attached${RESET}"
+          echo ""
+
+          echo -e "${BLUE}Step 3: Waiting for worker pods to be ready...${RESET}"
+          echo "Note: The container image is large (~10GB), this may take 5-10 minutes..."
+          echo ""
+
+          # Wait up to 15 minutes for pods to be ready
+          for i in {1..90}; do
+            # Get all pods, excluding those being deleted
+            ALL_PODS=$(oc get pods -l app=network-perf-test-worker --no-headers 2>/dev/null)
+
+            # Count total pods (exclude Terminating)
+            TOTAL_COUNT=$(echo "$ALL_PODS" | grep -v "Terminating" | wc -l | tr -d ' ')
+            [ -z "$TOTAL_COUNT" ] && TOTAL_COUNT=0
+
+            # Count ready pods (1/1 and Running)
+            READY_COUNT=$(echo "$ALL_PODS" | grep -v "Terminating" | grep "Running" | grep "1/1" | wc -l | tr -d ' ')
+            [ -z "$READY_COUNT" ] && READY_COUNT=0
+
+            echo "  Ready: $READY_COUNT/$TOTAL_COUNT pods (check ${i}/90)"
+
+            # Break if we have at least 2 pods ready and all current pods are ready
+            if [ "$READY_COUNT" -ge 2 ] 2>/dev/null && [ "$READY_COUNT" -eq "$TOTAL_COUNT" ] 2>/dev/null && [ "$TOTAL_COUNT" -gt 0 ] 2>/dev/null; then
+              echo "  All pods ready!"
+              break
+            fi
+
+            sleep 10
+          done
+
+          echo ""
+
+          # Get list of worker pods
+          WORKER_PODS=$(oc get pods -l app=network-perf-test-worker -o jsonpath='{.items[*].metadata.name}')
+          POD_COUNT=$(echo $WORKER_PODS | wc -w)
+
+          if [ "$POD_COUNT" -lt 2 ]; then
+            echo "ERROR: Need at least 2 worker pods, found $POD_COUNT"
+            echo "Worker pods: $WORKER_PODS"
+            exit 1
+          fi
+
+          echo -e "${GREEN}Found $POD_COUNT worker pods ready for testing${RESET}"
+          echo "Worker pods: $WORKER_PODS"
+          echo ""
+
+          # Convert to array
+          PODS=($WORKER_PODS)
+
+          echo ""
+          echo -e "${CYAN}=========================================="
+          echo -e "Network Performance Tests"
+          echo -e "==========================================${RESET}"
+          echo ""
+          echo -e "${BOLD}Test Suite Overview:${RESET}"
+          echo ""
+          echo "Testing 4MB RDMA transfers with 30 second duration + 5 second warmup"
+          echo ""
+          echo "Test Types:"
+          echo "  - RoCE:            RDMA over Converged Ethernet (system memory)"
+          echo "  - RoCE+CUDA:       RDMA with GPUDirect (GPU memory)"
+          echo "  - Sequential:      One NIC at a time (baseline performance)"
+          echo "  - Parallel:        All NICs simultaneously (real-world usage)"
+          echo "  - TCP:             Baseline TCP/IP comparison (iperf3)"
+          echo ""
+          echo "=========================================="
+          echo ""
+
+          # Detect all available SR-IOV interfaces on first pod
+          FIRST_POD=${PODS[0]}
+          SRIOV_NICS=$(oc exec $FIRST_POD -- bash -c "ip -br addr show | grep '^net' | awk '{print \$1}'" 2>/dev/null || echo "")
+          SRIOV_NICS=$(echo "$SRIOV_NICS" | tr '\n' ' ' | sed 's/ *$//')
+
+          if [ -z "$SRIOV_NICS" ]; then
+            echo "WARNING: No SR-IOV interfaces found (net1, net2, etc.)"
+            echo "Checking network interfaces on $FIRST_POD:"
+            oc exec $FIRST_POD -- ip -br addr show 2>&1 | head -10
+            SRIOV_NICS="net1"  # Fallback
+          fi
+
+          echo "Detected SR-IOV interfaces: $SRIOV_NICS"
+          echo "Testing unidirectional connectivity (source pod → all target pods)"
+          echo ""
+
+          # Use first pod as source, test to all other pods (unidirectional)
+          SOURCE_POD=${PODS[0]}
+          tested_targets=0
+
+          echo "Source pod: $SOURCE_POD"
+          echo ""
+
+          # Arrays to store results for table output
+          declare -a TEST_ROWS=()
+
+          for j in "${!PODS[@]}"; do
+            if [ $j -ne 0 ]; then
+              TARGET_POD=${PODS[$j]}
+
+              echo "Testing: $SOURCE_POD → $TARGET_POD"
+
+              # Kill any existing ulimit -l unlimited && ib_write_bw processes
+              oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              sleep 2
+
+              # Detect GPU models on both pods
+              SOURCE_GPUS=$(oc exec $SOURCE_POD -- bash -c "nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null | paste -sd ',' -" || echo "N/A")
+              SOURCE_GPUS=$(echo "$SOURCE_GPUS" | tr -d '\n')
+              TARGET_GPUS=$(oc exec $TARGET_POD -- bash -c "nvidia-smi --query-gpu=gpu_name --format=csv,noheader 2>/dev/null | paste -sd ',' -" || echo "N/A")
+              TARGET_GPUS=$(echo "$TARGET_GPUS" | tr -d '\n')
+
+              # Collect NIC configuration for all interfaces
+              declare -A NIC_SOURCE_IPS
+              declare -A NIC_TARGET_IPS
+              declare -A NIC_RDMA_DEVS
+              declare -A NIC_RDMA_PHYS_PORTS
+              declare -A NIC_SPEEDS
+              declare -A NIC_HOST_SEQ_GBPS
+              declare -A NIC_GPU_SEQ_GBPS
+              declare -A NIC_HOST_PAR_GBPS
+              declare -A NIC_GPU_PAR_GBPS
+              declare -A NIC_HOST_SEQ_ITERS
+              declare -A NIC_GPU_SEQ_ITERS
+              declare -A NIC_HOST_PAR_ITERS
+              declare -A NIC_GPU_PAR_ITERS
+              declare -a VALID_NICS=()
+
+              for NIC in $SRIOV_NICS; do
+                # Get IP addresses for this specific NIC
+                SOURCE_IP=$(oc exec $SOURCE_POD -- bash -c "ip -4 addr show $NIC 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null || echo "")
+                SOURCE_IP=$(echo "$SOURCE_IP" | tr -d '\n' | tr -d ' ')
+                TARGET_IP=$(oc exec $TARGET_POD -- bash -c "ip -4 addr show $NIC 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null || echo "")
+                TARGET_IP=$(echo "$TARGET_IP" | tr -d '\n' | tr -d ' ')
+
+                if [ -z "$SOURCE_IP" ] || [ -z "$TARGET_IP" ]; then
+                  echo "  [$NIC] ⚠ No IP - skipping"
+                  continue
+                fi
+
+                # Get RDMA device for this NIC by matching node GUID
+                NIC_GUID=$(oc exec $SOURCE_POD -- bash -c "cat /sys/class/net/$NIC/device/infiniband/*/node_guid 2>/dev/null | head -1" || echo "")
+                NIC_GUID=$(echo "$NIC_GUID" | tr -d '\n' | tr -d ' ')
+
+                if [ -n "$NIC_GUID" ]; then
+                  # Find RDMA device with matching GUID
+                  RDMA_DEV=$(oc exec $SOURCE_POD -- bash -c "for dev in /sys/class/infiniband/mlx*; do if grep -q '$NIC_GUID' \$dev/node_guid 2>/dev/null; then basename \$dev; break; fi; done" || echo "mlx5_0")
+                else
+                  # Fallback to first device
+                  RDMA_DEV=$(oc exec $SOURCE_POD -- bash -c "ibv_devices | grep 'mlx' | head -1 | awk '{print \$1}'" 2>/dev/null || echo "mlx5_0")
+                fi
+                RDMA_DEV=$(echo "$RDMA_DEV" | tr -d '\n' | tr -d ' ')
+
+                # Detect physical port count for dual-port HCA support
+                PHYS_PORTS=$(oc exec $SOURCE_POD -- bash -c "ibv_devinfo -d $RDMA_DEV 2>/dev/null | grep 'phys_port_cnt:' | awk '{print \$2}'" 2>/dev/null || echo "1")
+                PHYS_PORTS=$(echo "$PHYS_PORTS" | tr -d '\n' | tr -d ' ')
+                [ -z "$PHYS_PORTS" ] && PHYS_PORTS="1"
+
+                # Get NIC speed and lanes from ethtool
+                NIC_SPEED_MBPS=$(oc exec $SOURCE_POD -- bash -c "ethtool $NIC 2>/dev/null | grep 'Speed:' | awk '{print \$2}' | sed 's/Mb\/s//'" 2>/dev/null || echo "")
+                NIC_SPEED_MBPS=$(echo "$NIC_SPEED_MBPS" | tr -d '\n' | tr -d ' ')
+                NIC_LANES=$(oc exec $SOURCE_POD -- bash -c "ethtool $NIC 2>/dev/null | grep 'Lanes:' | awk '{print \$2}'" 2>/dev/null || echo "")
+                NIC_LANES=$(echo "$NIC_LANES" | tr -d '\n' | tr -d ' ')
+
+                # Convert Mb/s to Gb/s
+                if [ -n "$NIC_SPEED_MBPS" ]; then
+                  NIC_SPEED_GBPS=$(awk "BEGIN {printf \"%.0f\", $NIC_SPEED_MBPS / 1000}")
+                else
+                  NIC_SPEED_GBPS="Unknown"
+                fi
+
+                # Store configuration
+                NIC_SOURCE_IPS[$NIC]=$SOURCE_IP
+                NIC_TARGET_IPS[$NIC]=$TARGET_IP
+                NIC_RDMA_DEVS[$NIC]=$RDMA_DEV
+                NIC_RDMA_PHYS_PORTS[$NIC]=$PHYS_PORTS
+                NIC_SPEEDS[$NIC]=$NIC_SPEED_GBPS
+                VALID_NICS+=($NIC)
+
+                # Display configuration with dual-port indicator
+                DUALPORT_INDICATOR=""
+                [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null && DUALPORT_INDICATOR=" [dual-port]"
+
+                if [ -n "$NIC_LANES" ]; then
+                  echo "  [$NIC] $SOURCE_IP → $TARGET_IP (RDMA: $RDMA_DEV, ${NIC_SPEED_GBPS}G/${NIC_LANES}-lane${DUALPORT_INDICATOR})"
+                else
+                  echo "  [$NIC] $SOURCE_IP → $TARGET_IP (RDMA: $RDMA_DEV, ${NIC_SPEED_GBPS}G${DUALPORT_INDICATOR})"
+                fi
+              done
+
+              # Test 4MB messages only
+              SIZE_LABEL="4MB"
+              MSG_SIZE=4194304
+
+              echo ""
+              echo -e "${MAGENTA}=========================================="
+              echo -e "  SEQUENTIAL Tests (one NIC at a time)"
+              echo -e "==========================================${RESET}"
+              echo ""
+
+              # Sequential tests - run each NIC independently
+              for NIC in "${VALID_NICS[@]}"; do
+                NIC_SPEED=${NIC_SPEEDS[$NIC]}
+                RDMA_DEV=${NIC_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+                SOURCE_IP=${NIC_SOURCE_IPS[$NIC]}
+
+                # Determine if dual-port mode should be used
+                DUALPORT_FLAG=""
+                MODE_DESC="single-port"
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                  MODE_DESC="dual-port"
+                fi
+
+                echo "  Testing [$NIC] sequentially (Link: ${NIC_SPEED}G, $MODE_DESC)..."
+
+                # RoCE test (system memory)
+                echo "    RoCE test..."
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 > /tmp/ib_host_${NIC}_seq.log 2>&1 &"
+                sleep 3
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout 40 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_host_${NIC}_seq_result.log 2>&1"
+                HOST_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_host_${NIC}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                if [ -n "$HOST_RESULT" ]; then
+                  HOST_SEQ_GBPS=$(echo "$HOST_RESULT" | awk '{print $4}')
+                  HOST_SEQ_ITERS=$(echo "$HOST_RESULT" | awk '{print $2}')
+                  echo -e "      ${GREEN}Result: $HOST_SEQ_GBPS Gb/s ($HOST_SEQ_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_host_${NIC}_seq_result.log)"
+                else
+                  HOST_SEQ_GBPS="FAIL"
+                  HOST_SEQ_ITERS="0"
+                  echo -e "      ${RED}Result: FAIL${RESET}"
+                fi
+                NIC_HOST_SEQ_GBPS[$NIC]=$HOST_SEQ_GBPS
+                NIC_HOST_SEQ_ITERS[$NIC]=$HOST_SEQ_ITERS
+
+                oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                sleep 2
+
+                # RoCE+CUDA test (GPU memory)
+                echo "    RoCE+CUDA test..."
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 > /tmp/ib_gpu_${NIC}_seq.log 2>&1 &"
+                sleep 3
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout 40 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_gpu_${NIC}_seq_result.log 2>&1"
+                GPU_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_gpu_${NIC}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                if [ -n "$GPU_RESULT" ]; then
+                  GPU_SEQ_GBPS=$(echo "$GPU_RESULT" | awk '{print $4}')
+                  GPU_SEQ_ITERS=$(echo "$GPU_RESULT" | awk '{print $2}')
+                  echo -e "      ${GREEN}Result: $GPU_SEQ_GBPS Gb/s ($GPU_SEQ_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_gpu_${NIC}_seq_result.log)"
+                else
+                  GPU_SEQ_GBPS="FAIL"
+                  GPU_SEQ_ITERS="0"
+                  echo -e "      ${RED}Result: FAIL${RESET}"
+                fi
+                NIC_GPU_SEQ_GBPS[$NIC]=$GPU_SEQ_GBPS
+                NIC_GPU_SEQ_ITERS[$NIC]=$GPU_SEQ_ITERS
+
+                oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+                sleep 2
+                echo ""
+              done
+
+              echo ""
+              echo -e "${MAGENTA}=========================================="
+              echo -e "  PARALLEL Tests (all NICs simultaneously)"
+              echo -e "==========================================${RESET}"
+              echo ""
+
+              echo "  Running RoCE tests on ALL NICs in parallel (using separate processes per NIC)..."
+
+              # Build comma-separated list of RDMA devices and source IPs
+              RDMA_DEVICES=""
+              SOURCE_IPS=""
+              NIC_COUNT=0
+              for NIC in "${VALID_NICS[@]}"; do
+                if [ $NIC_COUNT -eq 0 ]; then
+                  RDMA_DEVICES="${NIC_RDMA_DEVS[$NIC]}"
+                  SOURCE_IPS="${NIC_SOURCE_IPS[$NIC]}"
+                else
+                  RDMA_DEVICES="${RDMA_DEVICES},${NIC_RDMA_DEVS[$NIC]}"
+                  SOURCE_IPS="${SOURCE_IPS},${NIC_SOURCE_IPS[$NIC]}"
+                fi
+                NIC_COUNT=$((NIC_COUNT + 1))
+              done
+
+              # If we have multiple NICs, try to test them individually in quick succession
+              # to reduce contention (instead of true parallel which causes memory bandwidth issues)
+              if [ $NIC_COUNT -gt 1 ]; then
+                echo "  Testing $NIC_COUNT NICs with optimized parallel approach (reduced queue pairs)..."
+              fi
+
+              # Start servers on all NICs (use different ports, reduced queue pairs, dual-port if available)
+              # Track tested RDMA devices to avoid duplicate tests on multi-port HCAs
+              declare -A TESTED_RDMA_DEVS
+              PORT=18515
+              for NIC in "${VALID_NICS[@]}"; do
+                RDMA_DEV=${NIC_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+
+                # Check if this is a multi-port device that we've already tested
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${TESTED_RDMA_DEVS[$RDMA_DEV]}" ]; then
+                  echo "    Skipping $NIC - already testing $RDMA_DEV (${PHYS_PORTS}-port HCA)"
+                  continue
+                fi
+
+                # Determine if dual-port mode should be used (only for 2-port HCAs)
+                DUALPORT_FLAG=""
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                fi
+
+                # Mark this device as tested to avoid duplicates
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                  TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
+                fi
+
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 > /tmp/ib_host_${NIC}_par.log 2>&1 &"
+                PORT=$((PORT + 1))
+              done
+              sleep 3
+
+              # Start clients on all NICs (will run in parallel with reduced contention)
+              # Build command to start all clients simultaneously in one oc exec
+              CLIENT_CMD="set +m; "  # Enable job control
+              declare -A CLIENT_TESTED_RDMA_DEVS
+              PORT=18515
+              for NIC in "${VALID_NICS[@]}"; do
+                RDMA_DEV=${NIC_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+                SOURCE_IP=${NIC_SOURCE_IPS[$NIC]}
+
+                # Check if this is a multi-port device that we've already tested
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${CLIENT_TESTED_RDMA_DEVS[$RDMA_DEV]}" ]; then
+                  continue
+                fi
+
+                # Determine if dual-port mode should be used (only for 2-port HCAs)
+                DUALPORT_FLAG=""
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                fi
+
+                # Mark this device as tested to avoid duplicates
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                  CLIENT_TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
+                fi
+
+                CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout 40 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_host_${NIC}_par_result.log 2>&1) & "
+                PORT=$((PORT + 1))
+              done
+              CLIENT_CMD="${CLIENT_CMD}sleep 35; wait"
+              oc exec $TARGET_POD -- bash -c "$CLIENT_CMD" &
+              sleep 2  # Give oc exec time to start
+
+              # Wait for tests to complete (30 seconds + 5 second buffer)
+              echo "  Waiting for RoCE tests to complete (30s)..."
+              sleep 35
+
+              # Collect results
+              for NIC in "${VALID_NICS[@]}"; do
+                HOST_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_host_${NIC}_par_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                if [ -n "$HOST_RESULT" ]; then
+                  HOST_PAR_GBPS=$(echo "$HOST_RESULT" | awk '{print $4}')
+                  HOST_PAR_ITERS=$(echo "$HOST_RESULT" | awk '{print $2}')
+                  echo -e "  [$NIC] RoCE: ${GREEN}$HOST_PAR_GBPS Gb/s ($HOST_PAR_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_host_${NIC}_par_result.log)"
+                else
+                  HOST_PAR_GBPS="FAIL"
+                  HOST_PAR_ITERS="0"
+                  echo "  [$NIC] RoCE: FAIL"
+                fi
+                NIC_HOST_PAR_GBPS[$NIC]=$HOST_PAR_GBPS
+                NIC_HOST_PAR_ITERS[$NIC]=$HOST_PAR_ITERS
+              done
+
+              # Cleanup
+              oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              sleep 2
+
+              echo ""
+              echo "  Running RoCE+CUDA tests on ALL NICs in parallel (using separate processes per NIC)..."
+
+              # Start GPU servers on all NICs (use different ports, reduced queue pairs, dual-port if available)
+              # Track tested RDMA devices to avoid duplicate tests on multi-port HCAs
+              declare -A GPU_TESTED_RDMA_DEVS
+              PORT=18515
+              for NIC in "${VALID_NICS[@]}"; do
+                RDMA_DEV=${NIC_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+
+                # Check if this is a multi-port device that we've already tested
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${GPU_TESTED_RDMA_DEVS[$RDMA_DEV]}" ]; then
+                  echo "    Skipping $NIC - already testing $RDMA_DEV (${PHYS_PORTS}-port HCA)"
+                  continue
+                fi
+
+                # Determine if dual-port mode should be used (only for 2-port HCAs)
+                DUALPORT_FLAG=""
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                fi
+
+                # Mark this device as tested to avoid duplicates
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                  GPU_TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
+                fi
+
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 > /tmp/ib_gpu_${NIC}_par.log 2>&1 &"
+                PORT=$((PORT + 1))
+              done
+              sleep 3
+
+              # Start GPU clients on all NICs (will run in parallel with reduced contention)
+              # Build command to start all GPU clients simultaneously in one oc exec
+              GPU_CLIENT_CMD="set +m; "  # Enable job control
+              declare -A GPU_CLIENT_TESTED_RDMA_DEVS
+              PORT=18515
+              for NIC in "${VALID_NICS[@]}"; do
+                RDMA_DEV=${NIC_RDMA_DEVS[$NIC]}
+                PHYS_PORTS=${NIC_RDMA_PHYS_PORTS[$NIC]}
+                SOURCE_IP=${NIC_SOURCE_IPS[$NIC]}
+
+                # Check if this is a multi-port device that we've already tested
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null && [ -n "${GPU_CLIENT_TESTED_RDMA_DEVS[$RDMA_DEV]}" ]; then
+                  continue
+                fi
+
+                # Determine if dual-port mode should be used (only for 2-port HCAs)
+                DUALPORT_FLAG=""
+                if [ "$PHYS_PORTS" -eq 2 ] 2>/dev/null; then
+                  DUALPORT_FLAG="-O"
+                fi
+
+                # Mark this device as tested to avoid duplicates
+                if [ "$PHYS_PORTS" -ge 2 ] 2>/dev/null; then
+                  GPU_CLIENT_TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
+                fi
+
+                GPU_CLIENT_CMD="${GPU_CLIENT_CMD}(ulimit -l unlimited; timeout 40 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_gpu_${NIC}_par_result.log 2>&1) & "
+                PORT=$((PORT + 1))
+              done
+              GPU_CLIENT_CMD="${GPU_CLIENT_CMD}sleep 35; wait"
+              oc exec $TARGET_POD -- bash -c "$GPU_CLIENT_CMD" &
+              sleep 2  # Give oc exec time to start
+
+              # Wait for tests to complete (30 seconds + 5 second buffer)
+              echo "  Waiting for RoCE+CUDA tests to complete (30s)..."
+              sleep 35
+
+              # Collect results
+              for NIC in "${VALID_NICS[@]}"; do
+                GPU_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_gpu_${NIC}_par_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
+
+                if [ -n "$GPU_RESULT" ]; then
+                  GPU_PAR_GBPS=$(echo "$GPU_RESULT" | awk '{print $4}')
+                  GPU_PAR_ITERS=$(echo "$GPU_RESULT" | awk '{print $2}')
+                  echo -e "  [$NIC] RoCE+CUDA: ${GREEN}$GPU_PAR_GBPS Gb/s ($GPU_PAR_ITERS iters)${RESET} (see $TARGET_POD:/tmp/ib_gpu_${NIC}_par_result.log)"
+                else
+                  GPU_PAR_GBPS="FAIL"
+                  GPU_PAR_ITERS="0"
+                  echo "  [$NIC] RoCE+CUDA: FAIL"
+                fi
+                NIC_GPU_PAR_GBPS[$NIC]=$GPU_PAR_GBPS
+                NIC_GPU_PAR_ITERS[$NIC]=$GPU_PAR_ITERS
+              done
+
+              # Cleanup
+              oc exec $SOURCE_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              oc exec $TARGET_POD -- pkill -9 ib_write_bw 2>/dev/null || true
+              sleep 1
+
+              # Store results for table
+              for NIC in "${VALID_NICS[@]}"; do
+                HOST_SEQ=${NIC_HOST_SEQ_GBPS[$NIC]}
+                GPU_SEQ=${NIC_GPU_SEQ_GBPS[$NIC]}
+                HOST_PAR=${NIC_HOST_PAR_GBPS[$NIC]}
+                GPU_PAR=${NIC_GPU_PAR_GBPS[$NIC]}
+                HOST_SEQ_ITER=${NIC_HOST_SEQ_ITERS[$NIC]}
+                GPU_SEQ_ITER=${NIC_GPU_SEQ_ITERS[$NIC]}
+                HOST_PAR_ITER=${NIC_HOST_PAR_ITERS[$NIC]}
+                GPU_PAR_ITER=${NIC_GPU_PAR_ITERS[$NIC]}
+                NIC_SPEED=${NIC_SPEEDS[$NIC]}
+
+                # Determine status (PASS if > 1000 iterations, FAIL otherwise)
+                [ "$HOST_SEQ_ITER" -gt 1000 ] 2>/dev/null && HOST_SEQ_STATUS="PASS" || HOST_SEQ_STATUS="FAIL"
+                [ "$GPU_SEQ_ITER" -gt 1000 ] 2>/dev/null && GPU_SEQ_STATUS="PASS" || GPU_SEQ_STATUS="FAIL"
+                [ "$HOST_PAR_ITER" -gt 1000 ] 2>/dev/null && HOST_PAR_STATUS="PASS" || HOST_PAR_STATUS="FAIL"
+                [ "$GPU_PAR_ITER" -gt 1000 ] 2>/dev/null && GPU_PAR_STATUS="PASS" || GPU_PAR_STATUS="FAIL"
+
+                # Calculate utilization percentages
+                if [ "$HOST_SEQ" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  HOST_SEQ_UTIL=$(awk "BEGIN {printf \"%.1f\", $HOST_SEQ / $NIC_SPEED * 100}")
+                else
+                  HOST_SEQ_UTIL="N/A"
+                fi
+
+                if [ "$GPU_SEQ" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  GPU_SEQ_UTIL=$(awk "BEGIN {printf \"%.1f\", $GPU_SEQ / $NIC_SPEED * 100}")
+                else
+                  GPU_SEQ_UTIL="N/A"
+                fi
+
+                if [ "$HOST_PAR" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  HOST_PAR_UTIL=$(awk "BEGIN {printf \"%.1f\", $HOST_PAR / $NIC_SPEED * 100}")
+                else
+                  HOST_PAR_UTIL="N/A"
+                fi
+
+                if [ "$GPU_PAR" != "FAIL" ] && [ "$NIC_SPEED" != "Unknown" ]; then
+                  GPU_PAR_UTIL=$(awk "BEGIN {printf \"%.1f\", $GPU_PAR / $NIC_SPEED * 100}")
+                else
+                  GPU_PAR_UTIL="N/A"
+                fi
+
+                TEST_ROWS+=("$SOURCE_POD|$TARGET_POD|$SOURCE_GPUS|$TARGET_GPUS|$NIC|$SIZE_LABEL|$NIC_SPEED|$HOST_SEQ|$HOST_SEQ_ITER|$HOST_SEQ_STATUS|$HOST_SEQ_UTIL|$GPU_SEQ|$GPU_SEQ_ITER|$GPU_SEQ_STATUS|$GPU_SEQ_UTIL|$HOST_PAR|$HOST_PAR_ITER|$HOST_PAR_STATUS|$HOST_PAR_UTIL|$GPU_PAR|$GPU_PAR_ITER|$GPU_PAR_STATUS|$GPU_PAR_UTIL")
+              done
+
+              tested_targets=$((tested_targets + 1))
+              echo ""
+            fi
+          done
+
+          echo ""
+          echo -e "${CYAN}======================================================================"
+          echo -e "Network Performance Test Results"
+          echo -e "======================================================================${RESET}"
+          echo ""
+          printf "%-32s %-32s %-12s %-12s %-4s %-4s %-4s %-9s %-7s %-4s %-9s %-7s %-4s %-9s %-7s %-4s %-9s %-7s %-4s\n" \
+            "Source" "Target" "Src-GPU" "Tgt-GPU" "NIC" "Size" "Link" "RoCE-Seq" "Iters" "Stat" "RoCE+C-Seq" "Iters" "Stat" "RoCE-Par" "Iters" "Stat" "RoCE+C-Par" "Iters" "Stat"
+          printf "%-32s %-32s %-12s %-12s %-4s %-4s %-4s %-9s %-7s %-4s %-9s %-7s %-4s %-9s %-7s %-4s %-9s %-7s %-4s\n" \
+            "--------------------------------" "--------------------------------" "------------" "------------" "----" "----" "----" "---------" "-------" "----" "---------" "-------" "----" "---------" "-------" "----" "---------" "-------" "----"
+
+          for row in "${TEST_ROWS[@]}"; do
+            IFS='|' read -r src tgt src_gpu tgt_gpu nic size link host_seq host_seq_iter host_seq_stat host_seq_util gpu_seq gpu_seq_iter gpu_seq_stat gpu_seq_util host_par host_par_iter host_par_stat host_par_util gpu_par gpu_par_iter gpu_par_stat gpu_par_util <<< "$row"
+            # Truncate names to fit
+            src_short=$(echo "$src" | cut -c1-31)
+            tgt_short=$(echo "$tgt" | cut -c1-31)
+            src_gpu_short=$(echo "$src_gpu" | cut -c1-11)
+            tgt_gpu_short=$(echo "$tgt_gpu" | cut -c1-11)
+            printf "%-32s %-32s %-12s %-12s %-4s %-4s %-4s %-9s %-7s %-4s %-9s %-7s %-4s %-9s %-7s %-4s %-9s %-7s %-4s\n" \
+              "$src_short" "$tgt_short" "$src_gpu_short" "$tgt_gpu_short" "$nic" "$size" "${link}G" "$host_seq" "$host_seq_iter" "$host_seq_stat" "$gpu_seq" "$gpu_seq_iter" "$gpu_seq_stat" "$host_par" "$host_par_iter" "$host_par_stat" "$gpu_par" "$gpu_par_iter" "$gpu_par_stat"
+          done
+
+          echo ""
+          echo "Column Descriptions:"
+          echo "  Src/Tgt-GPU    - GPU model(s) on each pod (comma-separated if multiple)"
+          echo "  Link           - NIC speed capability (Gb/s)"
+          echo "  RoCE-Seq       - RDMA from system memory, sequential (Gb/s)"
+          echo "  RoCE+C-Seq     - RDMA from GPU memory (GPUDirect), sequential (Gb/s)"
+          echo "  RoCE-Par       - RDMA from system memory, parallel (Gb/s)"
+          echo "  RoCE+C-Par     - RDMA from GPU memory (GPUDirect), parallel (Gb/s)"
+          echo "  Iters          - Number of iterations completed (>1000 = full run)"
+          echo "  Stat           - PASS if test completed, FAIL if terminated early"
+          echo ""
+          echo "Result files available on target pod for verification:"
+          echo "  Sequential: /tmp/ib_{host,gpu}_{nic}_seq_result.log"
+          echo "  Parallel:   /tmp/ib_{host,gpu}_{nic}_par_result.log"
+
+          echo ""
+          echo "Tested $tested_targets target nodes from source node across all NICs"
+          echo ""
+
+          echo -e "${CYAN}=========================================="
+          echo -e "Test 2: TCP Bandwidth (iperf3)"
+          echo -e "==========================================${RESET}"
+          echo ""
+          echo "Testing TCP bandwidth as baseline comparison to RDMA"
+          echo "Command: iperf3 -c <server_ip> -t 30 -P 4"
+          echo "  -t 30  : Run for 30 seconds"
+          echo "  -P 4   : Use 4 parallel streams"
+          echo ""
+          echo "Test modes:"
+          echo "  Sequential: One NIC at a time (baseline performance)"
+          echo "  Parallel:   All NICs simultaneously (real-world usage)"
+          echo ""
+
+          # Use first pod as source, test to all other pods (unidirectional)
+          SOURCE_POD=${PODS[0]}
+
+          echo "Source pod: $SOURCE_POD"
+          echo ""
+
+          # Arrays to store TCP results
+          declare -a TCP_ROWS=()
+
+          for j in "${!PODS[@]}"; do
+            if [ $j -ne 0 ]; then
+              TARGET_POD=${PODS[$j]}
+
+              echo "Testing TCP: $SOURCE_POD → $TARGET_POD"
+
+              # Kill any existing iperf3 processes
+              oc exec $SOURCE_POD -- pkill -9 iperf3 2>/dev/null || true
+              oc exec $TARGET_POD -- pkill -9 iperf3 2>/dev/null || true
+              sleep 2
+
+              # Collect NIC configuration for all interfaces
+              declare -A TCP_NIC_SOURCE_IPS
+              declare -A TCP_NIC_TARGET_IPS
+              declare -a TCP_VALID_NICS=()
+
+              for NIC in $SRIOV_NICS; do
+                # Get IP addresses for this specific NIC
+                SOURCE_IP=$(oc exec $SOURCE_POD -- bash -c "ip -4 addr show $NIC 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null || echo "")
+                SOURCE_IP=$(echo "$SOURCE_IP" | tr -d '\n' | tr -d ' ')
+                TARGET_IP=$(oc exec $TARGET_POD -- bash -c "ip -4 addr show $NIC 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null || echo "")
+                TARGET_IP=$(echo "$TARGET_IP" | tr -d '\n' | tr -d ' ')
+
+                if [ -z "$SOURCE_IP" ] || [ -z "$TARGET_IP" ]; then
+                  echo "  [$NIC] ⚠ No IP - skipping"
+                  continue
+                fi
+
+                # Store configuration
+                TCP_NIC_SOURCE_IPS[$NIC]=$SOURCE_IP
+                TCP_NIC_TARGET_IPS[$NIC]=$TARGET_IP
+                TCP_VALID_NICS+=($NIC)
+
+                echo "  [$NIC] Configured: $SOURCE_IP → $TARGET_IP"
+              done
+
+              echo ""
+              echo "  Running SEQUENTIAL TCP tests (one NIC at a time)..."
+
+              # Sequential TCP tests
+              declare -A TCP_SEQ_RESULTS
+              for NIC in "${TCP_VALID_NICS[@]}"; do
+                TARGET_IP=${TCP_NIC_TARGET_IPS[$NIC]}
+                NIC_NUM=$(echo "$NIC" | sed 's/net//')
+                PORT=$((5000 + NIC_NUM))
+
+                echo "    Testing [$NIC] sequentially..."
+
+                # Start iperf3 server
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup iperf3 -s -B $TARGET_IP -p $PORT > /tmp/iperf3_server_${NIC}_seq.log 2>&1 &"
+                sleep 2
+
+                # Run iperf3 client
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout 40 iperf3 -c $TARGET_IP -p $PORT -t 30 -P 4 > /tmp/iperf3_${NIC}_seq_result.log 2>&1"
+
+                # Collect result
+                TCP_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/iperf3_${NIC}_seq_result.log 2>/dev/null | grep '\\[SUM\\]' | grep 'sender' | tail -1" || echo "")
+
+                if [ -n "$TCP_RESULT" ]; then
+                  TCP_GBPS=$(echo "$TCP_RESULT" | awk '{print $6}')
+                  TCP_SEQ_RESULTS[$NIC]=$TCP_GBPS
+                  echo "      Result: $TCP_GBPS Gb/s"
+                else
+                  TCP_SEQ_RESULTS[$NIC]="FAIL"
+                  echo "      Result: FAIL"
+                fi
+
+                # Cleanup
+                oc exec $TARGET_POD -- pkill -9 iperf3 2>/dev/null || true
+                sleep 1
+              done
+
+              echo ""
+              echo "  Running PARALLEL TCP tests (all NICs simultaneously)..."
+
+              # Start iperf3 servers on all NICs
+              for NIC in "${TCP_VALID_NICS[@]}"; do
+                TARGET_IP=${TCP_NIC_TARGET_IPS[$NIC]}
+                NIC_NUM=$(echo "$NIC" | sed 's/net//')
+                PORT=$((5000 + NIC_NUM))
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; nohup iperf3 -s -B $TARGET_IP -p $PORT > /tmp/iperf3_server_${NIC}.log 2>&1 &"
+              done
+              sleep 3
+
+              # Start iperf3 clients on all NICs (will run in parallel)
+              # Build command to start all iperf3 clients simultaneously in one oc exec
+              TCP_CLIENT_CMD="set +m; "  # Enable job control
+              for NIC in "${TCP_VALID_NICS[@]}"; do
+                TARGET_IP=${TCP_NIC_TARGET_IPS[$NIC]}
+                NIC_NUM=$(echo "$NIC" | sed 's/net//')
+                PORT=$((5000 + NIC_NUM))
+                TCP_CLIENT_CMD="${TCP_CLIENT_CMD}(ulimit -l unlimited; timeout 40 iperf3 -c $TARGET_IP -p $PORT -t 30 -P 4 > /tmp/iperf3_${NIC}_result.log 2>&1) & "
+              done
+              TCP_CLIENT_CMD="${TCP_CLIENT_CMD}sleep 35; wait"
+              oc exec $SOURCE_POD -- bash -c "$TCP_CLIENT_CMD" &
+              sleep 2  # Give oc exec time to start
+
+              # Wait for tests to complete (30 seconds + 5 second buffer)
+              echo "  Waiting for iperf3 tests to complete (30s)..."
+              sleep 35
+
+              # Collect parallel results
+              for NIC in "${TCP_VALID_NICS[@]}"; do
+                TCP_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/iperf3_${NIC}_result.log 2>/dev/null | grep '\\[SUM\\]' | grep 'sender' | tail -1" || echo "")
+
+                if [ -n "$TCP_RESULT" ]; then
+                  # Extract Gbits/sec from iperf3 output (field 6)
+                  TCP_PAR_GBPS=$(echo "$TCP_RESULT" | awk '{print $6}')
+                  echo "  [$NIC] TCP: $TCP_PAR_GBPS Gb/s"
+                else
+                  TCP_PAR_GBPS="FAIL"
+                  echo "  [$NIC] TCP: FAIL"
+                fi
+
+                # Get sequential result
+                TCP_SEQ_GBPS=${TCP_SEQ_RESULTS[$NIC]}
+
+                # Get link speed
+                NIC_SPEED=${NIC_SPEEDS[$NIC]}
+
+                # Store results with both sequential and parallel
+                TCP_ROWS+=("$SOURCE_POD|$TARGET_POD|$NIC|$NIC_SPEED|$TCP_SEQ_GBPS|$TCP_PAR_GBPS")
+              done
+
+              # Cleanup
+              oc exec $SOURCE_POD -- pkill -9 iperf3 2>/dev/null || true
+              oc exec $TARGET_POD -- pkill -9 iperf3 2>/dev/null || true
+              sleep 1
+
+              echo ""
+            fi
+          done
+
+          echo ""
+          echo -e "${CYAN}======================================================================"
+          echo -e "TCP Bandwidth Results (iperf3)"
+          echo -e "======================================================================${RESET}"
+          echo ""
+          printf "%-32s %-32s %-5s %-9s %-15s %-15s\n" \
+            "Source Pod" "Target Pod" "NIC" "Link (G)" "TCP-Seq (Gb/s)" "TCP-Par (Gb/s)"
+          printf "%-32s %-32s %-5s %-9s %-15s %-15s\n" \
+            "--------------------------------" "--------------------------------" "-----" "---------" "---------------" "---------------"
+
+          for row in "${TCP_ROWS[@]}"; do
+            IFS='|' read -r src tgt nic link tcp_seq tcp_par <<< "$row"
+            src_short=$(echo "$src" | cut -c1-31)
+            tgt_short=$(echo "$tgt" | cut -c1-31)
+            printf "%-32s %-32s %-5s %-9s %-15s %-15s\n" \
+              "$src_short" "$tgt_short" "$nic" "${link}G" "$tcp_seq" "$tcp_par"
+          done
+
+          echo ""
+          echo "Column Descriptions:"
+          echo "  Link (G)           - NIC speed capability (Gb/s)"
+          echo "  TCP-Seq (Gb/s)     - TCP bandwidth sequential - one NIC at a time"
+          echo "  TCP-Par (Gb/s)     - TCP bandwidth parallel - all NICs simultaneously"
+          echo ""
+
+          echo ""
+          echo -e "${CYAN}=========================================="
+          echo -e "Test 3: NCCL Collective Operations"
+          echo -e "==========================================${RESET}"
+          echo ""
+          echo "Testing GPU collective operations with NCCL"
+          echo "Running on all worker pods..."
+          echo ""
+
+          # Arrays to store NCCL results
+          declare -a NCCL_ROWS=()
+
+          # NCCL tests to run
+          NCCL_TESTS=("all_reduce" "all_gather" "broadcast" "reduce_scatter")
+
+          for POD in ${PODS[@]}; do
+            echo "Running NCCL tests on pod: $POD"
+
+            # Detect number of GPUs in pod
+            GPU_COUNT=$(oc exec $POD -- bash -c "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \n' || echo "1")
+            [ -z "$GPU_COUNT" ] || [ "$GPU_COUNT" -eq 0 ] && GPU_COUNT=1
+            echo "  Detected $GPU_COUNT GPU(s)"
+
+            for TEST in "${NCCL_TESTS[@]}"; do
+              echo "  Running ${TEST}_perf..."
+
+              # Run NCCL test with JSON output (8B to 128MB, use all GPUs)
+              JSON_FILE="/tmp/nccl_${TEST}.json"
+              oc exec $POD -- bash -c "/opt/nccl-tests/build/${TEST}_perf -b 8 -e 128M -f 2 -g $GPU_COUNT -J $JSON_FILE >/dev/null 2>&1 && cat $JSON_FILE" > /tmp/local_nccl_${TEST}.json 2>&1
+
+              # Parse JSON results
+              if [ -f /tmp/local_nccl_${TEST}.json ] && grep -q '"okay":"true"' /tmp/local_nccl_${TEST}.json 2>/dev/null; then
+                # Extract all GPU models from JSON and format
+                if [ "$GPU_COUNT" -eq 1 ]; then
+                  GPU_MODEL=$(jq -r '.config.devices[0].device_info' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "N/A")
+                else
+                  GPU_MODEL=$(jq -r '.config.devices[0].device_info' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "N/A")
+                  GPU_MODEL="${GPU_MODEL} (x${GPU_COUNT})"
+                fi
+
+                # Extract peak bandwidth from last result (out-of-place)
+                PEAK_BW=$(jq -r '.results[-1].out_of_place.alg_bw' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "0")
+                PEAK_SIZE=$(jq -r '.results[-1].size' /tmp/local_nccl_${TEST}.json 2>/dev/null || echo "0")
+
+                # Convert size to human readable
+                if [ "$PEAK_SIZE" -ge 1048576 ]; then
+                  PEAK_SIZE_HR="$((PEAK_SIZE / 1048576))MB"
+                elif [ "$PEAK_SIZE" -ge 1024 ]; then
+                  PEAK_SIZE_HR="$((PEAK_SIZE / 1024))KB"
+                else
+                  PEAK_SIZE_HR="${PEAK_SIZE}B"
+                fi
+
+                STATUS="PASS"
+                echo "    Result: $PEAK_BW GB/s @ $PEAK_SIZE_HR (GPU: $GPU_MODEL)"
+              else
+                GPU_MODEL="N/A"
+                PEAK_BW="FAIL"
+                PEAK_SIZE_HR="N/A"
+                STATUS="FAIL"
+                echo "    Result: FAIL"
+              fi
+
+              # Store result
+              NCCL_ROWS+=("$POD|$GPU_MODEL|$TEST|$PEAK_SIZE_HR|$PEAK_BW|$STATUS")
+
+              # Cleanup temp file
+              rm -f /tmp/local_nccl_${TEST}.json
+            done
+            echo ""
+          done
+
+          echo ""
+          echo -e "${CYAN}======================================================================"
+          echo -e "NCCL Performance Test Results"
+          echo -e "======================================================================${RESET}"
+          echo ""
+          printf "%-32s %-20s %-15s %-12s %-15s %-6s\n" \
+            "Pod" "GPU Model" "Test" "Peak Size" "Peak BW (GB/s)" "Status"
+          printf "%-32s %-20s %-15s %-12s %-15s %-6s\n" \
+            "--------------------------------" "--------------------" "---------------" "------------" "---------------" "------"
+
+          for row in "${NCCL_ROWS[@]}"; do
+            IFS='|' read -r pod gpu_model test peak_size peak_bw status <<< "$row"
+            # Truncate pod name to fit
+            pod_short=$(echo "$pod" | cut -c1-31)
+            gpu_short=$(echo "$gpu_model" | cut -c1-19)
+            printf "%-32s %-20s %-15s %-12s %-15s %-6s\n" \
+              "$pod_short" "$gpu_short" "$test" "$peak_size" "$peak_bw" "$status"
+          done
+
+          echo ""
+          echo "Column Descriptions:"
+          echo "  Pod         - Worker pod name"
+          echo "  GPU Model   - NVIDIA GPU model detected (with count if multiple)"
+          echo "  Test        - NCCL collective operation tested"
+          echo "  Peak Size   - Message size at peak bandwidth"
+          echo "  Peak BW     - Peak algorithm bandwidth (GB/s)"
+          echo "  Status      - PASS if test completed successfully"
+          echo ""
+
+          echo ""
+          echo -e "${CYAN}=========================================="
+          echo -e "Test 4: Multi-Node NCCL Tests"
+          echo -e "==========================================${RESET}"
+          echo ""
+          echo "Testing multi-node GPU collective operations with torchrun"
+          echo "This tests actual network bandwidth between GPUs on different nodes"
+          echo ""
+
+          # Only run if we have 2+ nodes
+          if [ ${#PODS[@]} -ge 2 ]; then
+            # Create Python test script on coordinator
+            cat > /tmp/nccl_multinode_test.py << 'EOF_NCCL_SCRIPT'
+          #!/usr/bin/env python3
+          import torch
+          import torch.distributed as dist
+          import time
+          def main():
+              dist.init_process_group(backend='nccl')
+              rank = dist.get_rank()
+              device = torch.device(f'cuda:{rank % torch.cuda.device_count()}')
+              torch.cuda.set_device(device)
+              sizes = [4*1024*1024, 16*1024*1024, 64*1024*1024, 128*1024*1024]
+              results = []
+              for size in sizes:
+                  tensor = torch.randn(size // 4, device=device)
+                  for _ in range(10):
+                      dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                  torch.cuda.synchronize()
+                  iterations = 20
+                  start = time.time()
+                  for _ in range(iterations):
+                      dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                  torch.cuda.synchronize()
+                  elapsed = time.time() - start
+                  bytes_transferred = size * 2 * iterations
+                  bandwidth_gbps = (bytes_transferred / elapsed) * 8 / 1e9
+                  if rank == 0:
+                      size_mb = size / (1024*1024)
+                      results.append(f"{size_mb:.0f}MB:{bandwidth_gbps:.2f}")
+              if rank == 0:
+                  print(f"MULTINODE_NCCL_RESULTS: {','.join(results)}")
+              dist.destroy_process_group()
+          if __name__ == '__main__':
+              main()
+          EOF_NCCL_SCRIPT
+
+            # Copy script to all worker pods
+            for POD in ${PODS[@]}; do
+              oc cp /tmp/nccl_multinode_test.py $POD:/tmp/nccl_multinode_test.py 2>/dev/null
+            done
+
+            # Get master pod IP (first pod on net1)
+            MASTER_POD="${PODS[0]}"
+            MASTER_IP=$(oc exec $MASTER_POD -- bash -c "ip -4 addr show net1 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null | tr -d '\n')
+
+            echo "Master node: $MASTER_POD ($MASTER_IP)"
+            echo "Running multi-node NCCL all_reduce test on ${#PODS[@]} nodes..."
+            echo ""
+
+            # Start worker nodes in background (all except first)
+            for i in $(seq 1 $((${#PODS[@]}-1))); do
+              WORKER_POD="${PODS[$i]}"
+              echo "  Starting worker rank $i on $WORKER_POD..."
+              oc exec $WORKER_POD -- bash -c "
+                cd /tmp
+                torchrun \
+                  --nproc_per_node=1 \
+                  --nnodes=${#PODS[@]} \
+                  --node_rank=$i \
+                  --master_addr=$MASTER_IP \
+                  --master_port=29500 \
+                  /tmp/nccl_multinode_test.py 2>&1
+              " > /tmp/nccl_worker_${i}.log 2>&1 &
+            done
+
+            # Wait a bit for workers to start
+            sleep 3
+
+            # Run master node in foreground
+            echo "  Starting master rank 0 on $MASTER_POD..."
+            NCCL_OUTPUT=$(oc exec $MASTER_POD -- bash -c "
+              cd /tmp
+              torchrun \
+                --nproc_per_node=1 \
+                --nnodes=${#PODS[@]} \
+                --node_rank=0 \
+                --master_addr=$MASTER_IP \
+                --master_port=29500 \
+                /tmp/nccl_multinode_test.py 2>&1
+            ")
+
+            # Wait for background workers to finish
+            sleep 2
+
+            # Parse results
+            MULTINODE_RESULTS=$(echo "$NCCL_OUTPUT" | grep "MULTINODE_NCCL_RESULTS:" | cut -d: -f2-)
+
+            echo ""
+            echo -e "${CYAN}======================================================================"
+            echo -e "Multi-Node NCCL Performance Results"
+            echo -e "======================================================================${RESET}"
+            echo ""
+            printf "%-10s %-20s %-20s\n" "Size" "Bandwidth (Gb/s)" "Status"
+            printf "%-10s %-20s %-20s\n" "----------" "--------------------" "--------------------"
+
+            if [ -n "$MULTINODE_RESULTS" ]; then
+              # Parse comma-separated results: 4MB:131.63,16MB:145.21,...
+              IFS=',' read -ra RESULT_ARRAY <<< "$MULTINODE_RESULTS"
+              for result in "${RESULT_ARRAY[@]}"; do
+                SIZE=$(echo "$result" | cut -d: -f1)
+                BW=$(echo "$result" | cut -d: -f2)
+                printf "%-10s %-20s %-20s\n" "$SIZE" "$BW" "PASS"
+              done
+            else
+              echo "No results - test may have failed"
+            fi
+
+            echo ""
+            echo "Column Descriptions:"
+            echo "  Size       - Message size for all_reduce operation"
+            echo "  Bandwidth  - Network bandwidth between GPU nodes (Gb/s)"
+            echo "  Status     - PASS if test completed successfully"
+            echo ""
+            echo "Note: This test measures actual network performance for multi-GPU workloads"
+            echo "      GPUDirect RDMA is used when NCCL_NET_GDR_LEVEL=5"
+            echo ""
+
+          else
+            echo "Skipping multi-node NCCL tests - requires 2+ worker nodes"
+            echo ""
+          fi
+
+          echo ""
+          echo -e "${CYAN}=========================================="
+          echo -e "Test Summary"
+          echo -e "==========================================${RESET}"
+          echo "Worker nodes tested: $POD_COUNT"
+          echo "SR-IOV NICs detected: $SRIOV_NICS"
+          echo "Source pod: ${PODS[0]}"
+          echo "Target nodes tested: $tested_targets"
+          echo "Total tests per target:"
+          echo "  - Message size: 4MB"
+          echo "  - RoCE (system memory)"
+          echo "  - RoCE+CUDA (GPU memory with GPUDirect)"
+          echo "  - TCP (baseline comparison)"
+          echo "  - Sequential and parallel modes"
+          echo "  - Per NIC (all SR-IOV interfaces)"
+          echo "RDMA tests: $([ $tested_targets -gt 0 ] && echo 'COMPLETED' || echo 'SKIPPED - No RDMA devices found')"
+          echo "TCP tests: Check results above"
+          echo "NCCL tests: $([ ${#NCCL_ROWS[@]} -gt 0 ] && echo 'COMPLETED' || echo 'SKIPPED')"
+          echo ""
+          echo "Test coverage:"
+          echo "  - Unidirectional connectivity (source pod → all target pods)"
+          echo "  - Sequential: Each NIC tested independently (baseline)"
+          echo "  - Parallel: All NICs tested simultaneously (real-world)"
+          echo "  - RoCE and RoCE+CUDA (GPUDirect) tested"
+          echo "  - 30 second test duration for stable measurements"
+          echo ""
+          echo "To view detailed logs from worker pods:"
+          for POD in ${PODS[@]:0:3}; do
+            echo "  oc logs $POD"
+          done
+          echo ""
+
+          # Generate ASCII network topology diagram
+          echo ""
+          echo -e "${CYAN}=========================================="
+          echo -e "Network Topology Diagram"
+          echo -e "==========================================${RESET}"
+          echo ""
+
+          # Draw each connection from source to targets
+          SOURCE_POD=${PODS[0]}
+
+          for ((i=1; i<${#PODS[@]}; i++)); do
+            TARGET_POD="${PODS[$i]}"
+
+            # Get GPU models
+            SOURCE_GPU="N/A"
+            TARGET_GPU="N/A"
+            for row in "${TEST_ROWS[@]}"; do
+              IFS='|' read -r src_pod tgt_pod src_gpu tgt_gpu nic size speed host_seq host_seq_iter host_seq_stat host_seq_util gpu_seq gpu_seq_iter gpu_seq_stat gpu_seq_util host_par host_par_iter host_par_stat host_par_util gpu_par gpu_par_iter gpu_par_stat gpu_par_util <<< "$row"
+              if [ "$src_pod" = "$SOURCE_POD" ] && [ "$tgt_pod" = "$TARGET_POD" ]; then
+                SOURCE_GPU="$src_gpu"
+                TARGET_GPU="$tgt_gpu"
+                break
+              fi
+            done
+
+            # Get eth0 (pod network) IPs
+            SOURCE_ETH0=$(oc exec $SOURCE_POD -- bash -c "ip -4 addr show eth0 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null | tr -d '\n' | tr -d ' ')
+            TARGET_ETH0=$(oc exec $TARGET_POD -- bash -c "ip -4 addr show eth0 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null | tr -d '\n' | tr -d ' ')
+            [ -z "$SOURCE_ETH0" ] && SOURCE_ETH0="N/A"
+            [ -z "$TARGET_ETH0" ] && TARGET_ETH0="N/A"
+
+            # Shorten pod names for display
+            SOURCE_SHORT=$(echo "$SOURCE_POD" | sed 's/network-perf-test-worker-/worker-/')
+            TARGET_SHORT=$(echo "$TARGET_POD" | sed 's/network-perf-test-worker-/worker-/')
+
+            # Draw connection box with wide spacing (60 chars between boxes)
+            echo "┌──────────────────────────────────────┐                                                            ┌──────────────────────────────────────┐"
+            printf "│ %-36s │                                                            │ %-36s │\n" "$SOURCE_SHORT" "$TARGET_SHORT"
+            printf "│ GPU: %-31s │                                                            │ GPU: %-31s │\n" "$SOURCE_GPU" "$TARGET_GPU"
+            printf "│ eth0: %-30s │                                                            │ eth0: %-30s │\n" "$SOURCE_ETH0" "$TARGET_ETH0"
+            echo "├──────────────────────────────────────┤                                                            ├──────────────────────────────────────┤"
+
+            # Draw bandwidth lines for each NIC
+            for row in "${TEST_ROWS[@]}"; do
+              IFS='|' read -r src_pod tgt_pod src_gpu tgt_gpu nic size speed host_seq host_seq_iter host_seq_stat host_seq_util gpu_seq gpu_seq_iter gpu_seq_stat gpu_seq_util host_par host_par_iter host_par_stat host_par_util gpu_par gpu_par_iter gpu_par_stat gpu_par_util <<< "$row"
+              if [ "$src_pod" = "$SOURCE_POD" ] && [ "$tgt_pod" = "$TARGET_POD" ]; then
+                # Get source IP
+                SRC_IP=$(oc exec $SOURCE_POD -- bash -c "ip -4 addr show $nic 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null | tr -d '\n' | tr -d ' ')
+                TGT_IP=$(oc exec $TARGET_POD -- bash -c "ip -4 addr show $nic 2>/dev/null | grep 'inet ' | awk '{print \$2}' | cut -d/ -f1" 2>/dev/null | tr -d '\n' | tr -d ' ')
+
+                # Find TCP bandwidth for this NIC
+                TCP_PAR_GBPS="N/A"
+                for tcp_row in "${TCP_ROWS[@]}"; do
+                  IFS='|' read -r tcp_src_pod tcp_tgt_pod tcp_nic tcp_nic_speed tcp_seq_gbps tcp_par_gbps <<< "$tcp_row"
+                  if [ "$tcp_src_pod" = "$SOURCE_POD" ] && [ "$tcp_tgt_pod" = "$TARGET_POD" ] && [ "$tcp_nic" = "$nic" ]; then
+                    TCP_PAR_GBPS="$tcp_par_gbps"
+                    break
+                  fi
+                done
+
+                # Format bandwidth with both RoCE and TCP
+                BW_LABEL=$(printf "%s Gb/s (RoCE), %s Gb/s (TCP)" "$host_par" "$TCP_PAR_GBPS")
+
+                # Format: left box content (36 chars) + connection (60 chars) + right box content (36 chars)
+                LEFT_CONTENT=$(printf "%-4s %-15s (%3sG)" "$nic:" "$SRC_IP" "$speed")
+                RIGHT_CONTENT=$(printf "%-4s %-15s (%3sG)" "$nic:" "$TGT_IP" "$speed")
+                printf "│ %-36s │──%-54s─>│ %-36s │\n" "$LEFT_CONTENT" "$BW_LABEL" "$RIGHT_CONTENT"
+              fi
+            done
+
+            echo "└──────────────────────────────────────┘                                                            └──────────────────────────────────────┘"
+            echo ""
+          done
+
+          echo "Legend:"
+          echo "  • Each diagram shows connection from source (left) to target (right)"
+          echo "  • eth0: Pod management network (CNI)"
+          echo "  • netX: SR-IOV NICs with link speed in parentheses (e.g., 100G)"
+          echo "  • Bandwidth: Parallel RoCE and TCP performance (all NICs tested simultaneously)"
+          echo "  • Source pod: ${SOURCE_POD}"
+          echo ""
+
+          # Cleanup worker DaemonSet if CLEANUP_WORKERS=true
+          if [ "${CLEANUP_WORKERS:-true}" = "true" ]; then
+            echo ""
+            echo -e "${CYAN}==========================================${RESET}"
+            echo "Cleaning up worker DaemonSet..."
+            if oc delete daemonset network-perf-test-worker -n default 2>/dev/null; then
+              echo -e "${GREEN}✓ Worker DaemonSet deleted${RESET}"
+            else
+              echo -e "${YELLOW}⚠ Worker DaemonSet not found or already deleted${RESET}"
+            fi
+          else
+            echo ""
+            echo -e "${YELLOW}==========================================${RESET}"
+            echo "CLEANUP_WORKERS=false - Keeping worker pods running"
+            echo "To manually cleanup worker pods:"
+            echo "  oc delete daemonset network-perf-test-worker -n default"
+          fi
+
+          echo ""
+          echo "To cleanup test coordinator Job:"
+          echo "  oc delete -k manifests/99-network-perf-tests"
+          echo ""
+          echo -e "${GREEN}✓ Network performance testing complete!${RESET}"
+
+          # Generate HTML report
+          echo ""
+          echo -e "${CYAN}Generating HTML report...${RESET}"
+
+          # Copy Python modules to a writable location and generate report
+          mkdir -p /tmp/report-gen
+          cp /opt/report-generator/*.py /tmp/report-gen/
+          cd /tmp/report-gen
+
+          # Generate the report
+          python3 generate-report.py
+
+          # Start web server
+          echo ""
+          echo -e "${CYAN}Starting web server on port 8080...${RESET}"
+          cd /tmp/www
+          python3 -m http.server 8080 > /dev/null 2>&1 &
+
+          sleep 2
+          ROUTE_URL=$(oc get route network-perf-report -n default -o jsonpath='{.spec.host}' 2>/dev/null)
+
+          echo -e "${GREEN}✓ Web server started${RESET}"
+          if [ -n "$ROUTE_URL" ]; then
+            echo ""
+            echo -e "${GREEN}=========================================="
+            echo -e "Web Report Available!"
+            echo -e "==========================================${RESET}"
+            echo ""
+            echo -e "${BOLD}${CYAN}Open in browser: https://${ROUTE_URL}${RESET}"
+            echo ""
+          fi
+          echo -e "${YELLOW}Coordinator staying alive to serve web report...${RESET}"
+          sleep infinity
+      volumes:
+      - name: report-scripts
+        configMap:
+          name: report-generator-scripts
+          defaultMode: 0555

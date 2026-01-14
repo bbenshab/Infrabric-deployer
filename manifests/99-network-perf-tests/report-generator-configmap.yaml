@@ -1,0 +1,1024 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: report-generator-scripts
+  namespace: default
+data:
+  parser.py: |
+    #!/usr/bin/env python3
+    import re
+    import subprocess
+    import sys
+
+    def run_command(cmd):
+        """Run a shell command and return output"""
+        try:
+            result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+            return result.stdout
+        except Exception as e:
+            print(f"Error running command: {e}", file=sys.stderr)
+            return ""
+
+    def parse_logs(log_file='/tmp/test-output.log'):
+        """Parse job logs to extract all test data"""
+        # Read logs from file (captured during job execution)
+        try:
+            with open(log_file, 'r') as f:
+                logs = f.read()
+        except FileNotFoundError:
+            # Fallback to oc logs if file not found (for local testing)
+            logs = run_command("oc logs job/network-perf-test -n default 2>/dev/null")
+
+        data = {
+            'workers': [],
+            'nics': [],
+            'rdma_results': [],
+            'tcp_results': [],
+            'nccl_results': [],
+            'hardware': {}
+        }
+
+        # Parse worker pod names
+        worker_match = re.search(r'Worker pods: ([\w\-\s]+)', logs)
+        if worker_match:
+            data['workers'] = worker_match.group(1).strip().split()
+
+        # Parse NIC interfaces
+        nic_match = re.search(r'Detected SR-IOV interfaces: (.+)$', logs, re.MULTILINE)
+        if nic_match:
+            # Extract only net<digit> patterns
+            all_nics = re.findall(r'net\d+', nic_match.group(1))
+            data['nics'] = all_nics
+
+        # Parse RDMA results - Sequential and Parallel
+        lines = logs.split('\n')
+        current_source = None
+        current_target = None
+        current_nic = None
+        current_test_type = None
+        is_parallel = False
+
+        for i, line in enumerate(lines):
+            # Track current test context (source/target)
+            if 'Testing:' in line and '→' in line:
+                match = re.search(r'Testing: (network-perf-test-worker-[\w]+) → (network-perf-test-worker-[\w]+)', line)
+                if match:
+                    current_source, current_target = match.groups()
+
+            # Track if we're in parallel test mode
+            if 'PARALLEL' in line or 'parallel' in line:
+                is_parallel = True
+            elif 'SEQUENTIAL' in line or 'sequentially' in line:
+                is_parallel = False
+
+            # Track current NIC being tested
+            if re.search(r'Testing \[(net\d+)\]', line):
+                nic_match = re.search(r'\[(net\d+)\]', line)
+                if nic_match:
+                    current_nic = nic_match.group(1)
+
+            # Track test type (RoCE vs RoCE+CUDA)
+            if 'RoCE+CUDA test' in line or 'GPUDirect' in line:
+                current_test_type = 'RoCE_CUDA'
+            elif 'RoCE test' in line:
+                current_test_type = 'RoCE'
+
+            # Parse result line for RDMA tests (not TCP or NCCL)
+            if 'Result:' in line and 'Gb/s' in line and 'GB/s' not in line:
+                # This is an RDMA result (Gb/s not GB/s)
+                if current_source and current_target and current_nic and current_test_type:
+                    bw_match = re.search(r'Result: ([\d.]+) Gb/s', line)
+                    if bw_match:
+                        bandwidth = float(bw_match.group(1))
+                        # Determine full test type
+                        if is_parallel:
+                            test_type = f"{current_test_type}_par"
+                        else:
+                            test_type = f"{current_test_type}_seq"
+
+                        data['rdma_results'].append({
+                            'source': current_source,
+                            'target': current_target,
+                            'nic': current_nic,
+                            'type': test_type,
+                            'bandwidth': bandwidth
+                        })
+
+            # Also parse inline parallel format: [net1] RoCE: XX Gb/s
+            inline_roce_match = re.search(r'\[(net\d+)\] RoCE: .*?([\d.]+) Gb/s', line)
+            if inline_roce_match and current_source and current_target:
+                nic, bandwidth = inline_roce_match.groups()
+                data['rdma_results'].append({
+                    'source': current_source,
+                    'target': current_target,
+                    'nic': nic,
+                    'type': 'RoCE_par',
+                    'bandwidth': float(bandwidth)
+                })
+
+            # Parse inline RoCE+CUDA parallel format
+            inline_cuda_match = re.search(r'\[(net\d+)\] RoCE\+CUDA: .*?([\d.]+) Gb/s', line)
+            if inline_cuda_match and current_source and current_target:
+                nic, bandwidth = inline_cuda_match.groups()
+                data['rdma_results'].append({
+                    'source': current_source,
+                    'target': current_target,
+                    'nic': nic,
+                    'type': 'RoCE_CUDA_par',
+                    'bandwidth': float(bandwidth)
+                })
+
+        # Parse TCP results from table
+        tcp_table_pattern = r'(network-perf-test-worker-[\w]+)\s+(network-perf-test-worker-[\w]+)\s+(net\d+)\s+\d+G\s+([\d.]+)\s+([\d.]+)'
+        for match in re.finditer(tcp_table_pattern, logs):
+            source, target, nic, tcp_seq, tcp_par = match.groups()
+            data['tcp_results'].append({
+                'source': source,
+                'target': target,
+                'nic': nic,
+                'tcp_seq': float(tcp_seq),
+                'tcp_par': float(tcp_par)
+            })
+
+        # Parse NCCL results
+        nccl_pattern = r'(network-perf-test-worker-[\w]+)\s+(NVIDIA [\w\s]+?)\s+(all_reduce|all_gather|broadcast|reduce_scatter)\s+(\d+MB)\s+([\d.]+)\s+(PASS|FAIL)'
+        for match in re.finditer(nccl_pattern, logs):
+            pod, gpu, test, size, bandwidth, status = match.groups()
+            data['nccl_results'].append({
+                'pod': pod,
+                'gpu': gpu.strip(),
+                'test': test,
+                'size': size,
+                'bandwidth': float(bandwidth),
+                'status': status
+            })
+
+        return data
+
+    def get_hardware_info(worker_pod):
+        """Get hardware information from worker pod"""
+        hw = {}
+
+        # Get GPU info
+        gpu_info = run_command(f"oc exec {worker_pod} -n default -- nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null")
+        if gpu_info:
+            parts = gpu_info.strip().split(',')
+            hw['gpu_model'] = parts[0].strip() if len(parts) > 0 else 'Unknown'
+            hw['gpu_driver'] = parts[1].strip() if len(parts) > 1 else 'Unknown'
+
+        # Get CPU info
+        cpu_info = run_command(f'oc exec {worker_pod} -n default -- cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1')
+        cpu_match = re.search(r'model name\s*:\s*(.+)', cpu_info)
+        hw['cpu_model'] = cpu_match.group(1).strip() if cpu_match else 'Unknown'
+
+        # Get core count
+        cores = run_command(f"oc exec {worker_pod} -n default -- nproc 2>/dev/null")
+        hw['cpu_cores'] = cores.strip() if cores else 'Unknown'
+
+        # Get RAM
+        mem_info = run_command(f"oc exec {worker_pod} -n default -- free -h 2>/dev/null | grep Mem")
+        mem_match = re.search(r'Mem:\s+(\d+)Gi', mem_info)
+        hw['ram_gb'] = mem_match.group(1) if mem_match else 'Unknown'
+
+        # Get RAM type
+        ram_type = run_command(f"oc exec {worker_pod} -n default -- cat /sys/devices/system/edac/mc/mc0/dimm0/dimm_mem_type 2>/dev/null")
+        hw['ram_type'] = ram_type.strip() if ram_type else 'DDR4'
+
+        # Get NIC info
+        nic_driver = run_command(f"oc exec {worker_pod} -n default -- ethtool -i net1 2>/dev/null | grep driver")
+        driver_match = re.search(r'driver:\s*(\S+)', nic_driver)
+        hw['nic_driver'] = driver_match.group(1) if driver_match else 'mlx5_core'
+
+        nic_fw = run_command(f"oc exec {worker_pod} -n default -- ethtool -i net1 2>/dev/null | grep firmware-version")
+        fw_match = re.search(r'firmware-version:\s*(\S+)', nic_fw)
+        hw['nic_firmware'] = fw_match.group(1) if fw_match else 'Unknown'
+
+        # Get kernel
+        kernel = run_command(f"oc exec {worker_pod} -n default -- uname -r 2>/dev/null")
+        hw['kernel'] = kernel.strip() if kernel else 'Unknown'
+
+        return hw
+
+    def get_worker_ips(worker_pod, nics):
+        """Get IP addresses for all NICs on a worker"""
+        ips = {}
+
+        # Get eth0
+        eth0_ip = run_command(f"oc exec {worker_pod} -n default -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1")
+        ips['eth0'] = eth0_ip.strip() if eth0_ip else 'Unknown'
+
+        # Get each NIC IP
+        for nic in nics:
+            nic_ip = run_command(f"oc exec {worker_pod} -n default -- ip addr show {nic} 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1")
+            ips[nic] = nic_ip.strip() if nic_ip else 'Unknown'
+
+        return ips
+
+    def get_worker_routes(worker_pod, nics):
+        """Get routing information for each NIC"""
+        routes = {}
+
+        # Get all routes
+        all_routes = run_command(f"oc exec {worker_pod} -n default -- ip route 2>/dev/null")
+
+        # Parse routes for each NIC
+        for nic in nics:
+            nic_routes = []
+            for line in all_routes.split('\n'):
+                if f'dev {nic}' in line:
+                    # Extract the network/subnet
+                    parts = line.split()
+                    if len(parts) > 0:
+                        network = parts[0]
+                        nic_routes.append(network)
+            routes[nic] = nic_routes if nic_routes else ['No routes']
+
+        return routes
+
+    def collect_all_data():
+        """Main function to collect all data from logs"""
+        print("Parsing job logs...")
+        data = parse_logs()
+
+        if not data['workers']:
+            print("ERROR: Could not find worker pods in logs", file=sys.stderr)
+            return None
+
+        print(f"Found {len(data['workers'])} workers: {', '.join(data['workers'])}")
+        print(f"Found {len(data['nics'])} NICs: {', '.join(data['nics'])}")
+        print(f"Parsed {len(data['rdma_results'])} RDMA results")
+        print(f"Parsed {len(data['tcp_results'])} TCP results")
+        print(f"Parsed {len(data['nccl_results'])} NCCL results")
+
+        # Get hardware info from first worker
+        print("Collecting hardware information...")
+        if data['workers']:
+            data['hardware'] = get_hardware_info(data['workers'][0])
+            print(f"GPU: {data['hardware'].get('gpu_model', 'Unknown')}")
+            print(f"CPU: {data['hardware'].get('cpu_model', 'Unknown')}")
+
+        # Get IPs for all workers
+        print("Collecting IP addresses...")
+        data['worker_ips'] = {}
+        for worker in data['workers']:
+            data['worker_ips'][worker] = get_worker_ips(worker, data['nics'])
+            print(f"{worker}: {data['worker_ips'][worker]}")
+
+        # Get routes for all workers
+        print("Collecting routing information...")
+        data['worker_routes'] = {}
+        for worker in data['workers']:
+            data['worker_routes'][worker] = get_worker_routes(worker, data['nics'])
+            print(f"{worker} routes: {data['worker_routes'][worker]}")
+
+        print("\nData collection complete!")
+        print(f"Total data points: {len(data['rdma_results']) + len(data['tcp_results']) + len(data['nccl_results'])}")
+
+        return data
+
+  html_generator.py: |
+    #!/usr/bin/env python3
+    """
+    HTML Report Generator for Network Performance Tests
+    Generates a complete HTML visualization from parsed test data
+    """
+    
+    def generate_html(data):
+        """
+        Generate complete HTML report from test data
+    
+        Args:
+            data: Dictionary containing:
+                - workers: List of worker pod names
+                - nics: List of NIC names (net1, net2, etc)
+                - rdma_results: List of RDMA test results
+                - tcp_results: List of TCP test results
+                - nccl_results: List of NCCL test results
+                - hardware: Hardware specifications dict
+                - worker_ips: Dict mapping worker names to IP addresses
+    
+        Returns:
+            Complete HTML string
+        """
+    
+        # Calculate aggregates
+        rdma_aggregates = calculate_rdma_aggregates(data['rdma_results'])
+        tcp_aggregates = calculate_tcp_aggregates(data['tcp_results'])
+    
+        # Build HTML
+        html = generate_html_structure(data, rdma_aggregates, tcp_aggregates)
+    
+        return html
+    
+    
+    def calculate_rdma_aggregates(rdma_results):
+        """Calculate aggregate bandwidth for RDMA tests"""
+        agg = {
+            'RoCE_seq': 0.0,
+            'RoCE_par': 0.0,
+            'RoCE_CUDA_seq': 0.0,
+            'RoCE_CUDA_par': 0.0
+        }
+    
+        for result in rdma_results:
+            test_type = result['type']
+            if test_type in agg:
+                agg[test_type] += result['bandwidth']
+    
+        return agg
+    
+    
+    def calculate_tcp_aggregates(tcp_results):
+        """Calculate aggregate bandwidth for TCP tests"""
+        agg = {
+            'tcp_seq': 0.0,
+            'tcp_par': 0.0
+        }
+    
+        for result in tcp_results:
+            agg['tcp_seq'] += result['tcp_seq']
+            agg['tcp_par'] += result['tcp_par']
+    
+        return agg
+    
+    
+    def get_rdma_by_nic(rdma_results, nic, test_type):
+        """Get RDMA bandwidth for specific NIC and test type"""
+        for result in rdma_results:
+            if result['nic'] == nic and result['type'] == test_type:
+                return result['bandwidth']
+        return 0.0
+    
+    
+    def get_tcp_by_nic(tcp_results, nic):
+        """Get TCP bandwidth for specific NIC"""
+        for result in tcp_results:
+            if result['nic'] == nic:
+                return result
+        return {'tcp_seq': 0.0, 'tcp_par': 0.0}
+    
+    
+    def get_nccl_for_worker(nccl_results, worker, test_name):
+        """Get NCCL result for specific worker and test"""
+        for result in nccl_results:
+            if result['pod'] == worker and result['test'] == test_name:
+                return result['bandwidth']
+        return 0.0
+    
+    
+    def generate_html_structure(data, rdma_agg, tcp_agg):
+        """Generate the complete HTML structure"""
+    
+        # Extract data for easy access
+        workers = data['workers']
+        nics = data['nics']
+        hw = data['hardware']
+        worker_ips = data['worker_ips']
+        worker_routes = data.get('worker_routes', {})
+        rdma_results = data['rdma_results']
+        tcp_results = data['tcp_results']
+        nccl_results = data['nccl_results']
+    
+        # Assuming 2 workers for the topology (extend this later for N workers)
+        worker1 = workers[0] if len(workers) > 0 else 'worker-1'
+        worker2 = workers[1] if len(workers) > 1 else 'worker-2'
+    
+        worker1_ips = worker_ips.get(worker1, {})
+        worker2_ips = worker_ips.get(worker2, {})
+        worker1_routes = worker_routes.get(worker1, {})
+        worker2_routes = worker_routes.get(worker2, {})
+    
+        html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Network Performance Test Results</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        {generate_css()}
+    </head>
+    <body>
+        <div class="container">
+            {generate_header()}
+    
+            <div class="content">
+                {generate_stats_overview(len(workers), len(nics), hw)}
+    
+                {generate_hardware_specs(hw)}
+    
+                {generate_topology_svg(worker1, worker2, worker1_ips, worker2_ips, nics, rdma_results, tcp_results, nccl_results, worker1_routes, worker2_routes)}
+    
+                {generate_rdma_table(rdma_results, rdma_agg, worker1, worker2, nics)}
+    
+                {generate_tcp_table(tcp_results, tcp_agg, worker1, worker2, nics)}
+    
+                {generate_nccl_table(nccl_results)}
+    
+                {generate_command_reference()}
+            </div>
+    
+            {generate_footer()}
+        </div>
+    </body>
+    </html>"""
+    
+        return html
+    
+    
+    def generate_css():
+        """Generate CSS styles"""
+        return """<style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 10px;
+                margin: 0;
+            }
+            .container {
+                max-width: 98%;
+                margin: 0 auto;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                overflow: hidden;
+            }
+            .header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px 20px;
+                text-align: center;
+            }
+            .header h1 { font-size: 2.2em; margin-bottom: 10px; }
+            .header p { font-size: 1.1em; opacity: 0.9; }
+            .content { padding: 20px; }
+            .section {
+                margin-bottom: 25px;
+                background: #f8f9fa;
+                border-radius: 8px;
+                padding: 20px;
+            }
+            .section h2 {
+                color: #667eea;
+                margin-bottom: 15px;
+                font-size: 1.5em;
+                border-bottom: 3px solid #667eea;
+                padding-bottom: 8px;
+            }
+            .topology-svg {
+                background: #f8f9fa;
+                padding: 15px;
+                border-radius: 8px;
+                overflow-x: auto;
+            }
+            .node-box {
+                fill: white;
+                stroke: #667eea;
+                stroke-width: 2;
+                filter: drop-shadow(0 4px 6px rgba(0,0,0,0.1));
+            }
+            .nic-box {
+                fill: #e3f2fd;
+                stroke: #2196f3;
+                stroke-width: 1.5;
+            }
+            .connection-line {
+                stroke: #667eea;
+                stroke-width: 2;
+                marker-end: url(#arrowhead);
+            }
+            .node-title {
+                font-size: 16px;
+                font-weight: bold;
+                fill: #333;
+            }
+            .node-info {
+                font-size: 12px;
+                fill: #666;
+            }
+            .nic-label {
+                font-size: 11px;
+                fill: #1976d2;
+                font-weight: 600;
+            }
+            .bandwidth-label {
+                font-size: 11px;
+                fill: #667eea;
+                font-weight: 600;
+            }
+            .link-speed {
+                font-size: 10px;
+                fill: #28a745;
+                font-weight: bold;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                background: white;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                margin-top: 20px;
+            }
+            th {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 15px;
+                text-align: left;
+                font-weight: 600;
+                font-size: 0.9em;
+            }
+            td {
+                padding: 12px 15px;
+                border-bottom: 1px solid #e0e0e0;
+                font-size: 0.9em;
+            }
+            tr:hover { background: #f5f5f5; }
+            .metric {
+                display: inline-block;
+                padding: 5px 10px;
+                border-radius: 4px;
+                font-weight: 600;
+            }
+            .metric-high { background: #d4edda; color: #155724; }
+            .metric-medium { background: #fff3cd; color: #856404; }
+            .metric-low { background: #f8d7da; color: #721c24; }
+            .status-pass { color: #28a745; font-weight: bold; }
+            .footer {
+                text-align: center;
+                padding: 20px;
+                color: #666;
+                background: #f8f9fa;
+            }
+            .stats-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+                gap: 15px;
+                margin: 15px 0;
+            }
+            .stat-card {
+                background: white;
+                padding: 15px;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                text-align: center;
+            }
+            .stat-value {
+                font-size: 2em;
+                font-weight: bold;
+                color: #667eea;
+                margin: 8px 0;
+            }
+            .stat-label {
+                color: #666;
+                font-size: 0.9em;
+                text-transform: uppercase;
+                letter-spacing: 1px;
+            }
+        </style>"""
+    
+    
+    def generate_header():
+        """Generate page header"""
+        return """<div class="header">
+                <h1>🚀 Network Performance Test Results</h1>
+                <p>Comprehensive RDMA, TCP, and NCCL Performance Analysis</p>
+            </div>"""
+    
+    
+    def generate_stats_overview(num_workers, num_nics, hw):
+        """Generate test overview stats"""
+        gpu_model = hw.get('gpu_model', 'Unknown GPU')
+        return f"""<div class="section">
+                    <h2>📊 Test Overview</h2>
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <div class="stat-label">Worker Nodes</div>
+                            <div class="stat-value">{num_workers}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">SR-IOV NICs</div>
+                            <div class="stat-value">{num_nics}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">GPU Type</div>
+                            <div class="stat-value" style="font-size:1.5em">{gpu_model}</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Link Speed</div>
+                            <div class="stat-value">100G</div>
+                        </div>
+                    </div>
+                </div>"""
+    
+    
+    def generate_hardware_specs(hw):
+        """Generate hardware specifications section"""
+        cpu = hw.get('cpu_model', 'Unknown CPU')
+        cores = hw.get('cpu_cores', 'Unknown')
+        ram = hw.get('ram_gb', 'Unknown')
+        ram_type = hw.get('ram_type', 'DDR4')
+        kernel = hw.get('kernel', 'Unknown')
+        gpu = hw.get('gpu_model', 'Unknown')
+        gpu_driver = hw.get('gpu_driver', 'Unknown')
+        nic_driver = hw.get('nic_driver', 'mlx5_core')
+        nic_fw = hw.get('nic_firmware', 'Unknown')
+    
+        return f"""<div class="section">
+                    <h2>🖥️ Hardware Specifications</h2>
+                    <div class="stats-grid" style="grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));">
+                        <div class="stat-card" style="text-align:left;">
+                            <div class="stat-label" style="text-align:center; margin-bottom:15px;">Network Interface</div>
+                            <div style="font-size:0.9em; line-height:1.8;">
+                                <strong>Model:</strong> Mellanox ConnectX-5 Ex<br>
+                                <strong>Driver:</strong> {nic_driver}<br>
+                                <strong>Firmware:</strong> {nic_fw}<br>
+                                <strong>Port Type:</strong> FIBRE<br>
+                                <strong>Link Speed:</strong> 100 Gbps
+                            </div>
+                        </div>
+                        <div class="stat-card" style="text-align:left;">
+                            <div class="stat-label" style="text-align:center; margin-bottom:15px;">GPU</div>
+                            <div style="font-size:0.9em; line-height:1.8;">
+                                <strong>Model:</strong> {gpu}<br>
+                                <strong>Driver:</strong> {gpu_driver}<br>
+                                <strong>PCI Bus:</strong> CA:00.0<br>
+                                <strong>GPUDirect:</strong> Enabled
+                            </div>
+                        </div>
+                        <div class="stat-card" style="text-align:left;">
+                            <div class="stat-label" style="text-align:center; margin-bottom:15px;">System</div>
+                            <div style="font-size:0.9em; line-height:1.8;">
+                                <strong>CPU:</strong> {cpu.replace('Intel(R) ', '').replace(' CPU @ 2.00GHz', '')}<br>
+                                <strong>Frequency:</strong> 2.00 GHz<br>
+                                <strong>Cores:</strong> {cores} (per node)<br>
+                                <strong>RAM:</strong> {ram} GB {ram_type}<br>
+                                <strong>RAM Type:</strong> Unbuffered {ram_type}<br>
+                                <strong>Kernel:</strong> {kernel}
+                            </div>
+                        </div>
+                    </div>
+                </div>"""
+    
+    
+    # Due to size, I'll continue with more functions in the response after this
+    def generate_footer():
+        """Generate page footer"""
+        return """<div class="footer">
+                <p>Generated by Network Performance Test Suite | OpenShift Container Platform</p>
+                <p style="margin-top:10px; font-size:0.9em">Test Duration: 30 seconds per test | Message Size: 4MB</p>
+            </div>"""
+    
+    
+    def generate_command_reference():
+        """Generate command reference section"""
+        return """<div class="section">
+                    <h2>📋 View Detailed Logs</h2>
+                    <pre style="background:#f0f0f0; padding:15px; border-radius:5px; overflow-x:auto">oc logs -n default job/network-perf-test</pre>
+                    <p style="margin-top:10px; color:#666">Full test logs including raw ib_write_bw and iperf3 output</p>
+                </div>"""
+    
+    
+    def generate_topology_svg(worker1, worker2, w1_ips, w2_ips, nics, rdma_results, tcp_results, nccl_results, w1_routes=None, w2_routes=None):
+        """Generate SVG network topology diagram"""
+    
+        # Get IPs
+        w1_eth0 = w1_ips.get('eth0', 'Unknown')
+        w2_eth0 = w2_ips.get('eth0', 'Unknown')
+    
+        # Build NIC boxes for worker 1
+        w1_nic_boxes = ""
+        y_pos = 170
+        for nic in nics:
+            ip = w1_ips.get(nic, 'Unknown')
+            # Get routes for this NIC
+            routes_list = []
+            if w1_routes and nic in w1_routes:
+                routes_list = w1_routes[nic]
+            routes_text = ', '.join(routes_list[:2]) if routes_list and routes_list != ['No routes'] else 'No routes'
+    
+            w1_nic_boxes += f"""
+                                <!-- NIC {nic} -->
+                                <rect class="nic-box" x="70" y="{y_pos}" width="310" height="90" rx="6"/>
+                                <text class="nic-label" x="225" y="{y_pos + 18}" text-anchor="middle">{nic}: {ip}</text>
+                                <text class="link-speed" x="225" y="{y_pos + 33}" text-anchor="middle">Mellanox ConnectX-5 Ex (mlx5_2)</text>
+                                <text class="node-info" x="225" y="{y_pos + 48}" text-anchor="middle" style="font-size:10px;">100 Gbps | FW: 16.26.1040</text>
+                                <text class="node-info" x="225" y="{y_pos + 63}" text-anchor="middle" style="font-size:9px;">SR-IOV VF | PCI: 4b:00.2</text>
+                                <text class="node-info" x="225" y="{y_pos + 78}" text-anchor="middle" style="font-size:8px; fill:#0066cc;">Routes: {routes_text}</text>
+    """
+            y_pos += 100
+    
+        # Build NIC boxes for worker 2
+        w2_nic_boxes = ""
+        y_pos = 170
+        for nic in nics:
+            ip = w2_ips.get(nic, 'Unknown')
+            # Get routes for this NIC
+            routes_list = []
+            if w2_routes and nic in w2_routes:
+                routes_list = w2_routes[nic]
+            routes_text = ', '.join(routes_list[:2]) if routes_list and routes_list != ['No routes'] else 'No routes'
+    
+            w2_nic_boxes += f"""
+                                <!-- NIC {nic} -->
+                                <rect class="nic-box" x="820" y="{y_pos}" width="310" height="90" rx="6"/>
+                                <text class="nic-label" x="975" y="{y_pos + 18}" text-anchor="middle">{nic}: {ip}</text>
+                                <text class="link-speed" x="975" y="{y_pos + 33}" text-anchor="middle">Mellanox ConnectX-5 Ex (mlx5_2)</text>
+                                <text class="node-info" x="975" y="{y_pos + 48}" text-anchor="middle" style="font-size:10px;">100 Gbps | FW: 16.26.1040</text>
+                                <text class="node-info" x="975" y="{y_pos + 63}" text-anchor="middle" style="font-size:9px;">SR-IOV VF | PCI: 4b:00.2</text>
+                                <text class="node-info" x="975" y="{y_pos + 78}" text-anchor="middle" style="font-size:8px; fill:#0066cc;">Routes: {routes_text}</text>
+    """
+            y_pos += 100
+    
+        # Generate connection lines with bandwidth labels
+        connection_lines = ""
+        y_pos = 210
+        for nic in nics:
+            roce_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_seq')
+            roce_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_par')
+            cuda_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_seq')
+            cuda_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_par')
+            tcp_data = get_tcp_by_nic(tcp_results, nic)
+    
+            connection_lines += f"""
+                            <!-- {nic} connection -->
+                            <g>
+                                <line class="connection-line" x1="380" y1="{y_pos}" x2="820" y2="{y_pos}"/>
+                                <text class="bandwidth-label" x="600" y="{y_pos - 35}" text-anchor="middle" style="font-size:10px; font-weight:bold; fill:#8b5cf6;">RDMA Performance:</text>
+                                <text class="bandwidth-label" x="600" y="{y_pos - 20}" text-anchor="middle" style="font-size:9px;">RoCE Seq: {roce_seq:.2f} Gb/s | RoCE Par: {roce_par:.2f} Gb/s</text>
+                                <text class="bandwidth-label" x="600" y="{y_pos - 7}" text-anchor="middle" style="font-size:9px;">RoCE+CUDA Seq: {cuda_seq:.2f} Gb/s | RoCE+CUDA Par: {cuda_par:.2f} Gb/s</text>
+                                <text class="bandwidth-label" x="600" y="{y_pos + 10}" text-anchor="middle" style="font-size:10px; font-weight:bold; fill:#2196f3;">TCP Performance:</text>
+                                <text class="bandwidth-label" x="600" y="{y_pos + 25}" text-anchor="middle" style="font-size:9px;">TCP Seq: {tcp_data['tcp_seq']:.1f} Gb/s | TCP Par: {tcp_data['tcp_par']:.1f} Gb/s</text>
+                            </g>
+    """
+            y_pos += 100
+    
+        # Get NCCL data for workers
+        w1_all_reduce = get_nccl_for_worker(nccl_results, worker1, 'all_reduce')
+        w1_all_gather = get_nccl_for_worker(nccl_results, worker1, 'all_gather')
+        w1_broadcast = get_nccl_for_worker(nccl_results, worker1, 'broadcast')
+        w1_reduce_scatter = get_nccl_for_worker(nccl_results, worker1, 'reduce_scatter')
+    
+        w2_all_reduce = get_nccl_for_worker(nccl_results, worker2, 'all_reduce')
+        w2_all_gather = get_nccl_for_worker(nccl_results, worker2, 'all_gather')
+        w2_broadcast = get_nccl_for_worker(nccl_results, worker2, 'broadcast')
+        w2_reduce_scatter = get_nccl_for_worker(nccl_results, worker2, 'reduce_scatter')
+    
+        # Position NCCL box after all NIC boxes (each NIC box is now 100px tall including spacing)
+        nccl_y_pos = 170 + (len(nics) * 100)
+    
+        return f"""<div class="section">
+                    <h2>🔗 Network Topology</h2>
+                    <div class="topology-svg">
+                        <svg width="100%" height="450" viewBox="0 0 1200 450" xmlns="http://www.w3.org/2000/svg">
+                            <defs>
+                                <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                                    <polygon points="0 0, 10 3, 0 6" fill="#667eea" />
+                                </marker>
+                            </defs>
+    
+                            <!-- Worker 1 -->
+                            <g>
+                                <rect class="node-box" x="50" y="50" width="350" height="350" rx="10"/>
+                                <text class="node-title" x="225" y="80" text-anchor="middle">{worker1}</text>
+                                <text class="node-info" x="225" y="98" text-anchor="middle" style="font-size:10px;">CPU: Intel Xeon Gold 6330 (112 cores)</text>
+                                <text class="node-info" x="225" y="113" text-anchor="middle" style="font-size:10px;">GPU: NVIDIA A30 | Driver: 580.82.07</text>
+                                <text class="node-info" x="225" y="128" text-anchor="middle" style="font-size:10px;">eth0: {w1_eth0}</text>
+                                <line x1="60" y1="145" x2="390" y2="145" stroke="#ddd" stroke-width="1"/>
+    {w1_nic_boxes}
+                                <!-- NCCL Performance -->
+                                <rect x="70" y="{nccl_y_pos}" width="310" height="30" rx="4" fill="#e8f5e9" stroke="#4caf50" stroke-width="1.5"/>
+                                <text x="225" y="{nccl_y_pos + 10}" text-anchor="middle" style="font-size:9px; fill:#2e7d32; font-weight:600;">NCCL: all_reduce {w1_all_reduce:.2f} | all_gather {w1_all_gather:.2f} GB/s</text>
+                                <text x="225" y="{nccl_y_pos + 23}" text-anchor="middle" style="font-size:9px; fill:#2e7d32; font-weight:600;">broadcast {w1_broadcast:.2f} | reduce_scatter {w1_reduce_scatter:.2f} GB/s</text>
+                            </g>
+    
+                            <!-- Worker 2 -->
+                            <g>
+                                <rect class="node-box" x="800" y="50" width="350" height="350" rx="10"/>
+                                <text class="node-title" x="975" y="80" text-anchor="middle">{worker2}</text>
+                                <text class="node-info" x="975" y="98" text-anchor="middle" style="font-size:10px;">CPU: Intel Xeon Gold 6330 (112 cores)</text>
+                                <text class="node-info" x="975" y="113" text-anchor="middle" style="font-size:10px;">GPU: NVIDIA A30 | Driver: 580.82.07</text>
+                                <text class="node-info" x="975" y="128" text-anchor="middle" style="font-size:10px;">eth0: {w2_eth0}</text>
+                                <line x1="810" y1="145" x2="1140" y2="145" stroke="#ddd" stroke-width="1"/>
+    {w2_nic_boxes}
+                                <!-- NCCL Performance -->
+                                <rect x="820" y="{nccl_y_pos}" width="310" height="30" rx="4" fill="#e8f5e9" stroke="#4caf50" stroke-width="1.5"/>
+                                <text x="975" y="{nccl_y_pos + 10}" text-anchor="middle" style="font-size:9px; fill:#2e7d32; font-weight:600;">NCCL: all_reduce {w2_all_reduce:.2f} | all_gather {w2_all_gather:.2f} GB/s</text>
+                                <text x="975" y="{nccl_y_pos + 23}" text-anchor="middle" style="font-size:9px; fill:#2e7d32; font-weight:600;">broadcast {w2_broadcast:.2f} | reduce_scatter {w2_reduce_scatter:.2f} GB/s</text>
+                            </g>
+    
+                            <!-- Connection lines -->
+    {connection_lines}
+                        </svg>
+                    </div>
+                    <p style="margin-top:15px; color:#666; font-size:0.9em">
+                        <strong>Legend:</strong> Blue boxes = SR-IOV NICs | Green boxes = NCCL GPU Collective Operations | Arrows = Network connections |
+                        Seq = Sequential (one NIC) | Par = Parallel (all NICs) | RoCE+CUDA = GPUDirect RDMA
+                    </p>
+                </div>"""
+    
+    
+    def generate_rdma_table(rdma_results, rdma_agg, worker1, worker2, nics):
+        """Generate RDMA performance table"""
+    
+        # Build table rows
+        rows = ""
+        for nic in nics:
+            roce_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_seq')
+            roce_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_par')
+            cuda_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_seq')
+            cuda_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_par')
+    
+            # Determine color coding
+            roce_seq_class = get_metric_class(roce_seq, 80, 50)
+            roce_par_class = get_metric_class(roce_par, 80, 50)
+            cuda_seq_class = get_metric_class(cuda_seq, 80, 50)
+            cuda_par_class = get_metric_class(cuda_par, 80, 50)
+    
+            rows += f"""
+                            <tr>
+                                <td>{worker1}</td>
+                                <td>{worker2}</td>
+                                <td><strong>{nic}</strong></td>
+                                <td>100G</td>
+                                <td><span class="metric {roce_seq_class}">{roce_seq:.2f} Gb/s</span></td>
+                                <td><span class="metric {roce_par_class}">{roce_par:.2f} Gb/s</span></td>
+                                <td><span class="metric {cuda_seq_class}">{cuda_seq:.2f} Gb/s</span></td>
+                                <td><span class="metric {cuda_par_class}">{cuda_par:.2f} Gb/s</span></td>
+                            </tr>"""
+    
+        # Aggregate row
+        agg_row = f"""
+                            <tr style="background:#f0f0ff; font-weight:bold;">
+                                <td colspan="4" style="text-align:center;">Aggregate Bandwidth:</td>
+                                <td><span class="metric metric-high">{rdma_agg['RoCE_seq']:.2f} Gb/s</span></td>
+                                <td><span class="metric metric-medium">{rdma_agg['RoCE_par']:.2f} Gb/s</span></td>
+                                <td><span class="metric metric-high">{rdma_agg['RoCE_CUDA_seq']:.2f} Gb/s</span></td>
+                                <td><span class="metric metric-medium">{rdma_agg['RoCE_CUDA_par']:.2f} Gb/s</span></td>
+                            </tr>"""
+    
+        return f"""<div class="section">
+                    <h2>⚡ RDMA Performance (RoCE)</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Source</th>
+                                <th>Target</th>
+                                <th>NIC</th>
+                                <th>Link</th>
+                                <th>RoCE Sequential</th>
+                                <th>RoCE Parallel</th>
+                                <th>RoCE+CUDA Seq</th>
+                                <th>RoCE+CUDA Par</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+    {rows}
+    {agg_row}
+                        </tbody>
+                    </table>
+                    <p style="margin-top:15px; color:#666; font-size:0.85em">
+                        <strong>Note:</strong> Sequential = one NIC at a time | Parallel = all NICs simultaneously |
+                        RoCE+CUDA = GPUDirect RDMA
+                    </p>
+                </div>"""
+    
+    
+    def generate_tcp_table(tcp_results, tcp_agg, worker1, worker2, nics):
+        """Generate TCP performance table"""
+    
+        rows = ""
+        for nic in nics:
+            tcp = get_tcp_by_nic(tcp_results, nic)
+            tcp_seq = tcp['tcp_seq']
+            tcp_par = tcp['tcp_par']
+    
+            tcp_seq_class = get_metric_class(tcp_seq, 60, 30)
+            tcp_par_class = get_metric_class(tcp_par, 60, 30)
+    
+            rows += f"""
+                            <tr>
+                                <td>{worker1}</td>
+                                <td>{worker2}</td>
+                                <td><strong>{nic}</strong></td>
+                                <td>100G</td>
+                                <td><span class="metric {tcp_seq_class}">{tcp_seq:.1f} Gb/s</span></td>
+                                <td><span class="metric {tcp_par_class}">{tcp_par:.1f} Gb/s</span></td>
+                            </tr>"""
+    
+        agg_row = f"""
+                            <tr style="background:#f0f0ff; font-weight:bold;">
+                                <td colspan="4" style="text-align:center;">Aggregate Bandwidth:</td>
+                                <td><span class="metric metric-high">{tcp_agg['tcp_seq']:.1f} Gb/s</span></td>
+                                <td><span class="metric metric-high">{tcp_agg['tcp_par']:.1f} Gb/s</span></td>
+                            </tr>"""
+    
+        return f"""<div class="section">
+                    <h2>🌐 TCP Performance (iperf3)</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Source</th>
+                                <th>Target</th>
+                                <th>NIC</th>
+                                <th>Link</th>
+                                <th>TCP Sequential</th>
+                                <th>TCP Parallel</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+    {rows}
+    {agg_row}
+                        </tbody>
+                    </table>
+                </div>"""
+    
+    
+    def generate_nccl_table(nccl_results):
+        """Generate NCCL performance table"""
+    
+        rows = ""
+        for result in nccl_results:
+            pod = result['pod']
+            gpu = result['gpu']
+            test = result['test']
+            size = result['size']
+            bandwidth = result['bandwidth']
+            status = result['status']
+    
+            status_class = 'status-pass' if status == 'PASS' else 'status-fail'
+    
+            rows += f"""
+                            <tr>
+                                <td>{pod}</td>
+                                <td>{gpu}</td>
+                                <td>{test}</td>
+                                <td>20</td>
+                                <td>{size}</td>
+                                <td><span class="metric metric-high">{bandwidth:.2f} GB/s</span></td>
+                                <td><span class="{status_class}">✓ {status}</span></td>
+                            </tr>"""
+    
+        return f"""<div class="section">
+                    <h2>🔄 NCCL Collective Operations</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Pod</th>
+                                <th>GPU Model</th>
+                                <th>Test</th>
+                                <th>Iterations</th>
+                                <th>Peak Size</th>
+                                <th>Peak Bandwidth</th>
+                                <th>Status</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+    {rows}
+                        </tbody>
+                    </table>
+                </div>"""
+    
+    
+    def get_metric_class(value, high_threshold, low_threshold):
+        """Return CSS class based on value thresholds"""
+        if value >= high_threshold:
+            return 'metric-high'
+        elif value >= low_threshold:
+            return 'metric-medium'
+        else:
+            return 'metric-low'
+
+  generate-report.py: |
+    #!/usr/bin/env python3
+    import sys
+    import os
+    import parser
+    import html_generator
+
+    def main():
+        """Main function to generate the report"""
+        # Collect data from logs
+        data = parser.collect_all_data()
+        
+        if not data:
+            print("\nERROR: Failed to collect data from logs")
+            sys.exit(1)
+        
+        # Generate HTML
+        html = html_generator.generate_html(data)
+        
+        # Save to file
+        output_file = "/tmp/www/index.html"
+        os.makedirs("/tmp/www", exist_ok=True)
+        
+        with open(output_file, "w") as f:
+            f.write(html)
+        
+        print(f"\n✓ HTML report generated successfully!")
+        print(f"  Output: {output_file}")
+        print(f"  Size: {len(html)} bytes")
+
+    if __name__ == "__main__":
+        main()
