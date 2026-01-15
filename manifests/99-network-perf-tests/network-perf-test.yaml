@@ -185,7 +185,7 @@ spec:
           echo ""
           echo -e "${BOLD}Test Suite Overview:${RESET}"
           echo ""
-          echo "Testing 4MB RDMA transfers with 30 second duration + 5 second warmup"
+          echo "Testing 4MB RDMA transfers with 90 second duration + 5 second warmup"
           echo ""
           echo "Test Types:"
           echo "  - RoCE:            RDMA over Converged Ethernet (system memory)"
@@ -347,9 +347,9 @@ spec:
 
                 # RoCE test (system memory)
                 echo "    RoCE test..."
-                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 > /tmp/ib_host_${NIC}_seq.log 2>&1 &"
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 90 -F --report_gbits -q 2 > /tmp/ib_host_${NIC}_seq.log 2>&1 &"
                 sleep 3
-                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout 40 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_host_${NIC}_seq_result.log 2>&1"
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout 100 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 90 -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_host_${NIC}_seq_result.log 2>&1"
                 HOST_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_host_${NIC}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
 
                 if [ -n "$HOST_RESULT" ]; then
@@ -370,9 +370,9 @@ spec:
 
                 # RoCE+CUDA test (GPU memory)
                 echo "    RoCE+CUDA test..."
-                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 > /tmp/ib_gpu_${NIC}_seq.log 2>&1 &"
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 90 -F --report_gbits -q 2 > /tmp/ib_gpu_${NIC}_seq.log 2>&1 &"
                 sleep 3
-                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout 40 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 30 -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_gpu_${NIC}_seq_result.log 2>&1"
+                oc exec $TARGET_POD -- bash -c "ulimit -l unlimited; timeout 100 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -s $MSG_SIZE -D 90 -F --report_gbits -q 2 $SOURCE_IP > /tmp/ib_gpu_${NIC}_seq_result.log 2>&1"
                 GPU_RESULT=$(oc exec $TARGET_POD -- bash -c "cat /tmp/ib_gpu_${NIC}_seq_result.log 2>/dev/null | grep '$MSG_SIZE' | grep -v '#' | tail -1" || echo "")
 
                 if [ -n "$GPU_RESULT" ]; then
@@ -447,7 +447,7 @@ spec:
                   TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
                 fi
 
-                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 > /tmp/ib_host_${NIC}_par.log 2>&1 &"
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 90 -F --report_gbits -q 1 > /tmp/ib_host_${NIC}_par.log 2>&1 &"
                 PORT=$((PORT + 1))
               done
               sleep 3
@@ -478,15 +478,15 @@ spec:
                   CLIENT_TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
                 fi
 
-                CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout 40 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_host_${NIC}_par_result.log 2>&1) & "
+                CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout 100 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 90 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_host_${NIC}_par_result.log 2>&1) & "
                 PORT=$((PORT + 1))
               done
               CLIENT_CMD="${CLIENT_CMD}sleep 35; wait"
               oc exec $TARGET_POD -- bash -c "$CLIENT_CMD" &
               sleep 2  # Give oc exec time to start
 
-              # Wait for tests to complete (30 seconds + 5 second buffer)
-              echo "  Waiting for RoCE tests to complete (30s)..."
+              # Wait for tests to complete (90 seconds + 5 second buffer)
+              echo "  Waiting for RoCE tests to complete (90s)..."
               sleep 35
 
               # Collect results
@@ -539,7 +539,7 @@ spec:
                   GPU_TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
                 fi
 
-                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 > /tmp/ib_gpu_${NIC}_par.log 2>&1 &"
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; nohup ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 90 -F --report_gbits -q 1 > /tmp/ib_gpu_${NIC}_par.log 2>&1 &"
                 PORT=$((PORT + 1))
               done
               sleep 3
@@ -570,15 +570,15 @@ spec:
                   GPU_CLIENT_TESTED_RDMA_DEVS[$RDMA_DEV]=$PORT
                 fi
 
-                GPU_CLIENT_CMD="${GPU_CLIENT_CMD}(ulimit -l unlimited; timeout 40 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 30 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_gpu_${NIC}_par_result.log 2>&1) & "
+                GPU_CLIENT_CMD="${GPU_CLIENT_CMD}(ulimit -l unlimited; timeout 100 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 90 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_gpu_${NIC}_par_result.log 2>&1) & "
                 PORT=$((PORT + 1))
               done
               GPU_CLIENT_CMD="${GPU_CLIENT_CMD}sleep 35; wait"
               oc exec $TARGET_POD -- bash -c "$GPU_CLIENT_CMD" &
               sleep 2  # Give oc exec time to start
 
-              # Wait for tests to complete (30 seconds + 5 second buffer)
-              echo "  Waiting for RoCE+CUDA tests to complete (30s)..."
+              # Wait for tests to complete (90 seconds + 5 second buffer)
+              echo "  Waiting for RoCE+CUDA tests to complete (90s)..."
               sleep 35
 
               # Collect results
@@ -699,8 +699,8 @@ spec:
           echo -e "==========================================${RESET}"
           echo ""
           echo "Testing TCP bandwidth as baseline comparison to RDMA"
-          echo "Command: iperf3 -c <server_ip> -t 30 -P 4"
-          echo "  -t 30  : Run for 30 seconds"
+          echo "Command: iperf3 -c <server_ip> -t 90 -P 4"
+          echo "  -t 90  : Run for 90 seconds"
           echo "  -P 4   : Use 4 parallel streams"
           echo ""
           echo "Test modes:"
@@ -770,7 +770,7 @@ spec:
                 sleep 2
 
                 # Run iperf3 client
-                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout 40 iperf3 -c $TARGET_IP -p $PORT -t 30 -P 4 > /tmp/iperf3_${NIC}_seq_result.log 2>&1"
+                oc exec $SOURCE_POD -- bash -c "ulimit -l unlimited; timeout 100 iperf3 -c $TARGET_IP -p $PORT -t 90 -P 4 > /tmp/iperf3_${NIC}_seq_result.log 2>&1"
 
                 # Collect result
                 TCP_RESULT=$(oc exec $SOURCE_POD -- bash -c "cat /tmp/iperf3_${NIC}_seq_result.log 2>/dev/null | grep '\\[SUM\\]' | grep 'sender' | tail -1" || echo "")
@@ -808,14 +808,14 @@ spec:
                 TARGET_IP=${TCP_NIC_TARGET_IPS[$NIC]}
                 NIC_NUM=$(echo "$NIC" | sed 's/net//')
                 PORT=$((5000 + NIC_NUM))
-                TCP_CLIENT_CMD="${TCP_CLIENT_CMD}(ulimit -l unlimited; timeout 40 iperf3 -c $TARGET_IP -p $PORT -t 30 -P 4 > /tmp/iperf3_${NIC}_result.log 2>&1) & "
+                TCP_CLIENT_CMD="${TCP_CLIENT_CMD}(ulimit -l unlimited; timeout 100 iperf3 -c $TARGET_IP -p $PORT -t 90 -P 4 > /tmp/iperf3_${NIC}_result.log 2>&1) & "
               done
               TCP_CLIENT_CMD="${TCP_CLIENT_CMD}sleep 35; wait"
               oc exec $SOURCE_POD -- bash -c "$TCP_CLIENT_CMD" &
               sleep 2  # Give oc exec time to start
 
-              # Wait for tests to complete (30 seconds + 5 second buffer)
-              echo "  Waiting for iperf3 tests to complete (30s)..."
+              # Wait for tests to complete (90 seconds + 5 second buffer)
+              echo "  Waiting for iperf3 tests to complete (90s)..."
               sleep 35
 
               # Collect parallel results
@@ -1133,7 +1133,7 @@ spec:
           echo "  - Sequential: Each NIC tested independently (baseline)"
           echo "  - Parallel: All NICs tested simultaneously (real-world)"
           echo "  - RoCE and RoCE+CUDA (GPUDirect) tested"
-          echo "  - 30 second test duration for stable measurements"
+          echo "  - 90 second test duration for stable measurements"
           echo ""
           echo "To view detailed logs from worker pods:"
           for POD in ${PODS[@]:0:3}; do
