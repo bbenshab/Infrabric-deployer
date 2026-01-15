@@ -481,13 +481,15 @@ spec:
                 CLIENT_CMD="${CLIENT_CMD}(ulimit -l unlimited; timeout 100 ib_write_bw $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 90 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_host_${NIC}_par_result.log 2>&1) & "
                 PORT=$((PORT + 1))
               done
-              CLIENT_CMD="${CLIENT_CMD}sleep 35; wait"
+              CLIENT_CMD="${CLIENT_CMD}wait"
               oc exec $TARGET_POD -- bash -c "$CLIENT_CMD" &
+              EXEC_PID=$!
               sleep 2  # Give oc exec time to start
 
-              # Wait for tests to complete (90 seconds + 5 second buffer)
+              # Wait for tests to complete (90 seconds + 10 second buffer)
               echo "  Waiting for RoCE tests to complete (90s)..."
-              sleep 35
+              sleep 95
+              wait $EXEC_PID 2>/dev/null || true
 
               # Collect results
               for NIC in "${VALID_NICS[@]}"; do
@@ -573,13 +575,15 @@ spec:
                 GPU_CLIENT_CMD="${GPU_CLIENT_CMD}(ulimit -l unlimited; timeout 100 ib_write_bw --use_cuda=0 $DUALPORT_FLAG -d $RDMA_DEV -p $PORT -s $MSG_SIZE -D 90 -F --report_gbits -q 1 $SOURCE_IP > /tmp/ib_gpu_${NIC}_par_result.log 2>&1) & "
                 PORT=$((PORT + 1))
               done
-              GPU_CLIENT_CMD="${GPU_CLIENT_CMD}sleep 35; wait"
+              GPU_CLIENT_CMD="${GPU_CLIENT_CMD}wait"
               oc exec $TARGET_POD -- bash -c "$GPU_CLIENT_CMD" &
+              GPU_EXEC_PID=$!
               sleep 2  # Give oc exec time to start
 
-              # Wait for tests to complete (90 seconds + 5 second buffer)
+              # Wait for tests to complete (90 seconds + 10 second buffer)
               echo "  Waiting for RoCE+CUDA tests to complete (90s)..."
-              sleep 35
+              sleep 95
+              wait $GPU_EXEC_PID 2>/dev/null || true
 
               # Collect results
               for NIC in "${VALID_NICS[@]}"; do
@@ -810,13 +814,15 @@ spec:
                 PORT=$((5000 + NIC_NUM))
                 TCP_CLIENT_CMD="${TCP_CLIENT_CMD}(ulimit -l unlimited; timeout 100 iperf3 -c $TARGET_IP -p $PORT -t 90 -P 4 > /tmp/iperf3_${NIC}_result.log 2>&1) & "
               done
-              TCP_CLIENT_CMD="${TCP_CLIENT_CMD}sleep 35; wait"
+              TCP_CLIENT_CMD="${TCP_CLIENT_CMD}wait"
               oc exec $SOURCE_POD -- bash -c "$TCP_CLIENT_CMD" &
+              TCP_EXEC_PID=$!
               sleep 2  # Give oc exec time to start
 
-              # Wait for tests to complete (90 seconds + 5 second buffer)
+              # Wait for tests to complete (90 seconds + 10 second buffer)
               echo "  Waiting for iperf3 tests to complete (90s)..."
-              sleep 35
+              sleep 95
+              wait $TCP_EXEC_PID 2>/dev/null || true
 
               # Collect parallel results
               for NIC in "${TCP_VALID_NICS[@]}"; do
