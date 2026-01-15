@@ -22,12 +22,10 @@ data:
 
     def parse_logs(log_file='/tmp/test-output.log'):
         """Parse job logs to extract all test data"""
-        # Read logs from file (captured during job execution)
         try:
             with open(log_file, 'r') as f:
                 logs = f.read()
         except FileNotFoundError:
-            # Fallback to oc logs if file not found (for local testing)
             logs = run_command("oc logs job/network-perf-test -n default 2>/dev/null")
 
         data = {
@@ -36,6 +34,7 @@ data:
             'rdma_results': [],
             'tcp_results': [],
             'nccl_results': [],
+            'multinode_nccl_results': [],
             'hardware': {}
         }
 
@@ -47,11 +46,10 @@ data:
         # Parse NIC interfaces
         nic_match = re.search(r'Detected SR-IOV interfaces: (.+)$', logs, re.MULTILINE)
         if nic_match:
-            # Extract only net<digit> patterns
             all_nics = re.findall(r'net\d+', nic_match.group(1))
             data['nics'] = all_nics
 
-        # Parse RDMA results - Sequential and Parallel
+        # Parse RDMA results
         lines = logs.split('\n')
         current_source = None
         current_target = None
@@ -60,38 +58,31 @@ data:
         is_parallel = False
 
         for i, line in enumerate(lines):
-            # Track current test context (source/target)
             if 'Testing:' in line and '→' in line:
                 match = re.search(r'Testing: (network-perf-test-worker-[\w]+) → (network-perf-test-worker-[\w]+)', line)
                 if match:
                     current_source, current_target = match.groups()
 
-            # Track if we're in parallel test mode
             if 'PARALLEL' in line or 'parallel' in line:
                 is_parallel = True
             elif 'SEQUENTIAL' in line or 'sequentially' in line:
                 is_parallel = False
 
-            # Track current NIC being tested
             if re.search(r'Testing \[(net\d+)\]', line):
                 nic_match = re.search(r'\[(net\d+)\]', line)
                 if nic_match:
                     current_nic = nic_match.group(1)
 
-            # Track test type (RoCE vs RoCE+CUDA)
             if 'RoCE+CUDA test' in line or 'GPUDirect' in line:
                 current_test_type = 'RoCE_CUDA'
             elif 'RoCE test' in line:
                 current_test_type = 'RoCE'
 
-            # Parse result line for RDMA tests (not TCP or NCCL)
             if 'Result:' in line and 'Gb/s' in line and 'GB/s' not in line:
-                # This is an RDMA result (Gb/s not GB/s)
                 if current_source and current_target and current_nic and current_test_type:
                     bw_match = re.search(r'Result: ([\d.]+) Gb/s', line)
                     if bw_match:
                         bandwidth = float(bw_match.group(1))
-                        # Determine full test type
                         if is_parallel:
                             test_type = f"{current_test_type}_par"
                         else:
@@ -105,7 +96,6 @@ data:
                             'bandwidth': bandwidth
                         })
 
-            # Also parse inline parallel format: [net1] RoCE: XX Gb/s
             inline_roce_match = re.search(r'\[(net\d+)\] RoCE: .*?([\d.]+) Gb/s', line)
             if inline_roce_match and current_source and current_target:
                 nic, bandwidth = inline_roce_match.groups()
@@ -117,7 +107,6 @@ data:
                     'bandwidth': float(bandwidth)
                 })
 
-            # Parse inline RoCE+CUDA parallel format
             inline_cuda_match = re.search(r'\[(net\d+)\] RoCE\+CUDA: .*?([\d.]+) Gb/s', line)
             if inline_cuda_match and current_source and current_target:
                 nic, bandwidth = inline_cuda_match.groups()
@@ -129,7 +118,7 @@ data:
                     'bandwidth': float(bandwidth)
                 })
 
-        # Parse TCP results from table
+        # Parse TCP results
         tcp_table_pattern = r'(network-perf-test-worker-[\w]+)\s+(network-perf-test-worker-[\w]+)\s+(net\d+)\s+\d+G\s+([\d.]+)\s+([\d.]+)'
         for match in re.finditer(tcp_table_pattern, logs):
             source, target, nic, tcp_seq, tcp_par = match.groups()
@@ -141,7 +130,7 @@ data:
                 'tcp_par': float(tcp_par)
             })
 
-        # Parse NCCL results
+        # Parse single-node NCCL results
         nccl_pattern = r'(network-perf-test-worker-[\w]+)\s+(NVIDIA [\w\s]+?)\s+(all_reduce|all_gather|broadcast|reduce_scatter)\s+(\d+MB)\s+([\d.]+)\s+(PASS|FAIL)'
         for match in re.finditer(nccl_pattern, logs):
             pod, gpu, test, size, bandwidth, status = match.groups()
@@ -154,38 +143,50 @@ data:
                 'status': status
             })
 
+        # Parse multi-node NCCL results
+        multinode_section = re.search(r'Multi-Node NCCL Performance Results.*?Size.*?Bandwidth.*?Status.*?\n-+\s+-+\s+-+\s*\n(.*?)(?:\n\nColumn|$)', logs, re.DOTALL)
+        if multinode_section:
+            for line in multinode_section.group(1).strip().split('\n'):
+                parts = line.split()
+                if len(parts) >= 3 and 'MB' in parts[0]:
+                    try:
+                        size = parts[0].strip()
+                        bandwidth = float(parts[1].strip())
+                        status = parts[2].strip()
+                        data['multinode_nccl_results'].append({
+                            'size': size,
+                            'bandwidth': bandwidth,
+                            'status': status
+                        })
+                    except (ValueError, IndexError):
+                        continue
+
         return data
 
     def get_hardware_info(worker_pod):
         """Get hardware information from worker pod"""
         hw = {}
 
-        # Get GPU info
         gpu_info = run_command(f"oc exec {worker_pod} -n default -- nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null")
         if gpu_info:
             parts = gpu_info.strip().split(',')
             hw['gpu_model'] = parts[0].strip() if len(parts) > 0 else 'Unknown'
             hw['gpu_driver'] = parts[1].strip() if len(parts) > 1 else 'Unknown'
 
-        # Get CPU info
         cpu_info = run_command(f'oc exec {worker_pod} -n default -- cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1')
         cpu_match = re.search(r'model name\s*:\s*(.+)', cpu_info)
         hw['cpu_model'] = cpu_match.group(1).strip() if cpu_match else 'Unknown'
 
-        # Get core count
         cores = run_command(f"oc exec {worker_pod} -n default -- nproc 2>/dev/null")
         hw['cpu_cores'] = cores.strip() if cores else 'Unknown'
 
-        # Get RAM
         mem_info = run_command(f"oc exec {worker_pod} -n default -- free -h 2>/dev/null | grep Mem")
         mem_match = re.search(r'Mem:\s+(\d+)Gi', mem_info)
         hw['ram_gb'] = mem_match.group(1) if mem_match else 'Unknown'
 
-        # Get RAM type
         ram_type = run_command(f"oc exec {worker_pod} -n default -- cat /sys/devices/system/edac/mc/mc0/dimm0/dimm_mem_type 2>/dev/null")
         hw['ram_type'] = ram_type.strip() if ram_type else 'DDR4'
 
-        # Get NIC info
         nic_driver = run_command(f"oc exec {worker_pod} -n default -- ethtool -i net1 2>/dev/null | grep driver")
         driver_match = re.search(r'driver:\s*(\S+)', nic_driver)
         hw['nic_driver'] = driver_match.group(1) if driver_match else 'mlx5_core'
@@ -194,7 +195,6 @@ data:
         fw_match = re.search(r'firmware-version:\s*(\S+)', nic_fw)
         hw['nic_firmware'] = fw_match.group(1) if fw_match else 'Unknown'
 
-        # Get kernel
         kernel = run_command(f"oc exec {worker_pod} -n default -- uname -r 2>/dev/null")
         hw['kernel'] = kernel.strip() if kernel else 'Unknown'
 
@@ -204,11 +204,9 @@ data:
         """Get IP addresses for all NICs on a worker"""
         ips = {}
 
-        # Get eth0
         eth0_ip = run_command(f"oc exec {worker_pod} -n default -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1")
         ips['eth0'] = eth0_ip.strip() if eth0_ip else 'Unknown'
 
-        # Get each NIC IP
         for nic in nics:
             nic_ip = run_command(f"oc exec {worker_pod} -n default -- ip addr show {nic} 2>/dev/null | grep 'inet ' | awk '{{print $2}}' | cut -d/ -f1")
             ips[nic] = nic_ip.strip() if nic_ip else 'Unknown'
@@ -218,16 +216,12 @@ data:
     def get_worker_routes(worker_pod, nics):
         """Get routing information for each NIC"""
         routes = {}
-
-        # Get all routes
         all_routes = run_command(f"oc exec {worker_pod} -n default -- ip route 2>/dev/null")
 
-        # Parse routes for each NIC
         for nic in nics:
             nic_routes = []
             for line in all_routes.split('\n'):
                 if f'dev {nic}' in line:
-                    # Extract the network/subnet
                     parts = line.split()
                     if len(parts) > 0:
                         network = parts[0]
@@ -235,6 +229,50 @@ data:
             routes[nic] = nic_routes if nic_routes else ['No routes']
 
         return routes
+
+    def get_nic_models(worker_pod, nics):
+        """Get NIC model information for each interface"""
+        nic_models = {}
+
+        for nic in nics:
+            # Get NIC model from ethtool
+            nic_info = run_command(f"oc exec {worker_pod} -n default -- ethtool -i {nic} 2>/dev/null")
+
+            # Extract bus-info (PCI address)
+            bus_match = re.search(r'bus-info:\s*(\S+)', nic_info)
+            pci_addr = bus_match.group(1) if bus_match else 'Unknown'
+
+            # Get device description from lspci if available
+            if pci_addr and pci_addr != 'Unknown':
+                device_info = run_command(f"oc exec {worker_pod} -n default -- lspci -s {pci_addr} 2>/dev/null")
+                # Extract model name from lspci output
+                if 'Mellanox' in device_info or 'ConnectX' in device_info:
+                    model_match = re.search(r'(ConnectX-\d+[^\[]*)', device_info)
+                    if model_match:
+                        nic_models[nic] = model_match.group(1).strip()
+                    else:
+                        nic_models[nic] = 'Mellanox NIC'
+                else:
+                    nic_models[nic] = device_info.split(':')[-1].strip() if ':' in device_info else 'Unknown NIC'
+            else:
+                nic_models[nic] = 'Unknown NIC'
+
+        return nic_models
+
+    def get_nic_speeds(worker_pod, nics):
+        """Get NIC speed information for each interface"""
+        nic_speeds = {}
+
+        for nic in nics:
+            # Get NIC speed from ethtool
+            speed_info = run_command(f"oc exec {worker_pod} -n default -- ethtool {nic} 2>/dev/null | grep Speed")
+            speed_match = re.search(r'Speed:\s*(\d+\w+/s)', speed_info)
+            if speed_match:
+                nic_speeds[nic] = speed_match.group(1)
+            else:
+                nic_speeds[nic] = 'Unknown'
+
+        return nic_speeds
 
     def collect_all_data():
         """Main function to collect all data from logs"""
@@ -249,7 +287,8 @@ data:
         print(f"Found {len(data['nics'])} NICs: {', '.join(data['nics'])}")
         print(f"Parsed {len(data['rdma_results'])} RDMA results")
         print(f"Parsed {len(data['tcp_results'])} TCP results")
-        print(f"Parsed {len(data['nccl_results'])} NCCL results")
+        print(f"Parsed {len(data['nccl_results'])} single-node NCCL results")
+        print(f"Parsed {len(data['multinode_nccl_results'])} multi-node NCCL results")
 
         # Get hardware info from first worker
         print("Collecting hardware information...")
@@ -272,10 +311,25 @@ data:
             data['worker_routes'][worker] = get_worker_routes(worker, data['nics'])
             print(f"{worker} routes: {data['worker_routes'][worker]}")
 
+        # Get NIC models for all workers
+        print("Collecting NIC model information...")
+        data['worker_nic_models'] = {}
+        for worker in data['workers']:
+            data['worker_nic_models'][worker] = get_nic_models(worker, data['nics'])
+            print(f"{worker} NIC models: {data['worker_nic_models'][worker]}")
+
+        # Get NIC speeds for all workers
+        print("Collecting NIC speed information...")
+        data['worker_nic_speeds'] = {}
+        for worker in data['workers']:
+            data['worker_nic_speeds'][worker] = get_nic_speeds(worker, data['nics'])
+            print(f"{worker} NIC speeds: {data['worker_nic_speeds'][worker]}")
+
         print("\nData collection complete!")
-        print(f"Total data points: {len(data['rdma_results']) + len(data['tcp_results']) + len(data['nccl_results'])}")
+        print(f"Total data points: {len(data['rdma_results']) + len(data['tcp_results']) + len(data['nccl_results']) + len(data['multinode_nccl_results'])}")
 
         return data
+
 
   html_generator.py: |
     #!/usr/bin/env python3
@@ -990,35 +1044,994 @@ data:
         else:
             return 'metric-low'
 
+  circular_topology.py: |
+    #!/usr/bin/env python3
+    """
+    Network Topology with Server Icons - Cytoscape.js Version
+    Generates interactive visualization with NIC breakdown for parallel tests
+    """
+    import json
+    import sys
+    sys.path.insert(0, '/scripts')
+    from parser import collect_all_data
+
+    def generate_circular_topology_html(data):
+        """Generate topology using Cytoscape.js with original server icons and full names"""
+
+        workers = data['workers']
+        nics = data['nics']
+        rdma_results = data['rdma_results']
+        tcp_results = data['tcp_results']
+        nccl_results = data.get('nccl_results', [])
+        multinode_nccl_results = data.get('multinode_nccl_results', [])
+        worker_ips = data.get('worker_ips', {})
+        worker_routes = data.get('worker_routes', {})
+        worker_nic_models = data.get('worker_nic_models', {})
+        worker_nic_speeds = data.get('worker_nic_speeds', {})
+        hardware = data.get('hardware', {})
+
+        # Build Cytoscape nodes
+        cy_nodes = []
+        cy_edges = []
+
+        if workers:
+            source_node = workers[0]
+            source_ips = worker_ips.get(source_node, {})
+            source_routes = worker_routes.get(source_node, {})
+            source_nic_models = worker_nic_models.get(source_node, {})
+            source_nic_speeds = worker_nic_speeds.get(source_node, {})
+
+            source_nccl = {
+                'all_reduce': 0,
+                'all_gather': 0,
+                'reduce_scatter': 0,
+                'broadcast': 0
+            }
+            for result in nccl_results:
+                if result['pod'] == source_node:
+                    test_name = result['test']
+                    source_nccl[test_name] = result.get('bandwidth', 0)
+
+            nic_info = []
+            for nic in nics:
+                routes = ', '.join(source_routes.get(nic, ['N/A'])[:2])
+                model = source_nic_models.get(nic, 'Unknown')[:30]
+                speed = source_nic_speeds.get(nic, 'Unknown')
+                nic_info.append({
+                    'name': nic,
+                    'ip': source_ips.get(nic, 'N/A'),
+                    'routes': routes,
+                    'model': model,
+                    'speed': speed
+                })
+
+            cy_nodes.append({
+                'data': {
+                    'id': source_node,
+                    'label': source_node,  # Full name
+                    'type': 'source',
+                    'eth0': source_ips.get('eth0', 'N/A'),
+                    'gpu': hardware.get('gpu_model', 'Unknown'),
+                    'cpu': hardware.get('cpu_model', 'Unknown').replace('Intel(R) ', '').replace(' CPU @ 2.00GHz', '')[:40],
+                    'cores': hardware.get('cpu_cores', 'Unknown'),
+                    'nics': json.dumps(nic_info),
+                    'nccl': json.dumps(source_nccl)
+                }
+            })
+
+            # Target nodes
+            for i, worker in enumerate(workers[1:], 1):
+                worker_ip = worker_ips.get(worker, {})
+                worker_route = worker_routes.get(worker, {})
+                worker_nic_model = worker_nic_models.get(worker, {})
+                worker_nic_speed = worker_nic_speeds.get(worker, {})
+
+                target_nccl = {
+                    'all_reduce': 0,
+                    'all_gather': 0,
+                    'reduce_scatter': 0,
+                    'broadcast': 0
+                }
+                for result in nccl_results:
+                    if result['pod'] == worker:
+                        test_name = result['test']
+                        target_nccl[test_name] = result.get('bandwidth', 0)
+
+                nic_info = []
+                for nic in nics:
+                    routes = ', '.join(worker_route.get(nic, ['N/A'])[:2])
+                    model = worker_nic_model.get(nic, 'Unknown')[:30]
+                    speed = worker_nic_speed.get(nic, 'Unknown')
+                    nic_info.append({
+                        'name': nic,
+                        'ip': worker_ip.get(nic, 'N/A'),
+                        'routes': routes,
+                        'model': model,
+                        'speed': speed
+                    })
+
+                cy_nodes.append({
+                    'data': {
+                        'id': worker,
+                        'label': worker,  # Full name
+                        'type': 'target',
+                        'eth0': worker_ip.get('eth0', 'N/A'),
+                        'gpu': hardware.get('gpu_model', 'Unknown'),
+                        'cpu': hardware.get('cpu_model', 'Unknown').replace('Intel(R) ', '').replace(' CPU @ 2.00GHz', '')[:40],
+                        'cores': hardware.get('cpu_cores', 'Unknown'),
+                        'nics': json.dumps(nic_info),
+                        'nccl': json.dumps(target_nccl)
+                    }
+                })
+
+                # Create individual NIC edges (sequential only)
+                for nic_idx, nic in enumerate(nics):
+                    roce_seq = 0
+                    cuda_seq = 0
+                    tcp_seq = 0
+
+                    for result in rdma_results:
+                        if result['source'] == source_node and result['target'] == worker and result['nic'] == nic:
+                            if result['type'] == 'RoCE_seq':
+                                roce_seq = result['bandwidth']
+                            elif result['type'] == 'RoCE_CUDA_seq':
+                                cuda_seq = result['bandwidth']
+
+                    for result in tcp_results:
+                        if result['source'] == source_node and result['target'] == worker and result['nic'] == nic:
+                            tcp_seq = result.get('tcp_seq', 0)
+
+                    # Get NIC speed
+                    nic_speed = worker_nic_speed.get(nic, 'Unknown')
+
+                    if roce_seq > 0 or cuda_seq > 0 or tcp_seq > 0:
+                        cy_edges.append({
+                            'data': {
+                                'id': f"{source_node}-{worker}-{nic}",
+                                'source': source_node,
+                                'target': worker,
+                                'nic': nic,
+                                'nicIndex': nic_idx,
+                                'edgeType': 'individual',
+                                'roce_seq': roce_seq,
+                                'cuda_seq': cuda_seq,
+                                'tcp_seq': tcp_seq,
+                                'nic_speed': nic_speed,
+                                'bandwidth': roce_seq,
+                                'label': f"{nic}"
+                            }
+                        })
+
+                # Create aggregate edge for parallel data (sum of all NICs)
+                total_roce_par = 0
+                total_cuda_par = 0
+                total_tcp_par = 0
+
+                # Track individual NIC contributions
+                roce_par_nics = {}
+                cuda_par_nics = {}
+                tcp_par_nics = {}
+
+                for result in rdma_results:
+                    if result['source'] == source_node and result['target'] == worker:
+                        if result['type'] == 'RoCE_par':
+                            total_roce_par += result['bandwidth']
+                            roce_par_nics[result['nic']] = result['bandwidth']
+                        elif result['type'] == 'RoCE_CUDA_par':
+                            total_cuda_par += result['bandwidth']
+                            cuda_par_nics[result['nic']] = result['bandwidth']
+
+                for result in tcp_results:
+                    if result['source'] == source_node and result['target'] == worker:
+                        tcp_par_val = result.get('tcp_par', 0)
+                        total_tcp_par += tcp_par_val
+                        if tcp_par_val > 0:
+                            tcp_par_nics[result['nic']] = tcp_par_val
+
+                if total_roce_par > 0 or total_cuda_par > 0 or total_tcp_par > 0:
+                    cy_edges.append({
+                        'data': {
+                            'id': f"{source_node}-{worker}-aggregate",
+                            'source': source_node,
+                            'target': worker,
+                            'nic': 'ALL NICs',
+                            'nicIndex': len(nics),  # Put it last
+                            'edgeType': 'aggregate',
+                            'roce_par': total_roce_par,
+                            'cuda_par': total_cuda_par,
+                            'tcp_par': total_tcp_par,
+                            'roce_par_nics': json.dumps(roce_par_nics),
+                            'cuda_par_nics': json.dumps(cuda_par_nics),
+                            'tcp_par_nics': json.dumps(tcp_par_nics),
+                            'bandwidth': total_roce_par,
+                            'label': 'ALL (Parallel)'
+                        }
+                    })
+
+        cy_elements = {'nodes': cy_nodes, 'edges': cy_edges}
+        cy_data = json.dumps(cy_elements)
+        multinode_nccl_data = json.dumps(multinode_nccl_results)
+
+        html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Network Topology - Server Icons</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                padding: 20px;
+            }}
+            .container {{
+                max-width: 98%;
+                margin: 0 auto;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                overflow: hidden;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 30px;
+                text-align: center;
+            }}
+            .header h1 {{ font-size: 2.2em; margin-bottom: 10px; }}
+            .controls {{
+                background: #f8f9fa;
+                padding: 20px;
+                border-bottom: 1px solid #ddd;
+                display: flex;
+                gap: 15px;
+                flex-wrap: wrap;
+                align-items: center;
+            }}
+            .btn {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 14px;
+                font-weight: 600;
+                transition: transform 0.2s, box-shadow 0.2s;
+            }}
+            .btn:hover {{
+                transform: translateY(-2px);
+                box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+            }}
+            #cy {{
+                width: 100%;
+                height: 800px;
+                background: #fafafa;
+            }}
+            .info-panel {{
+                position: absolute;
+                top: 120px;
+                right: 30px;
+                width: 320px;
+                background: white;
+                border-radius: 8px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+                padding: 15px;
+                max-height: 85vh;
+                overflow-y: auto;
+                display: none;
+                z-index: 1000;
+            }}
+            .info-panel.visible {{
+                display: block;
+            }}
+            .info-panel h3 {{
+                color: #667eea;
+                margin-bottom: 10px;
+                font-size: 16px;
+            }}
+            .info-panel .close-btn {{
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: none;
+                border: none;
+                font-size: 20px;
+                cursor: pointer;
+                color: #999;
+            }}
+            .info-item {{
+                margin: 8px 0;
+                font-size: 12px;
+                padding: 8px;
+                background: #f8f9fa;
+                border-radius: 4px;
+            }}
+            .info-item strong {{
+                color: #667eea;
+            }}
+            .multinode-nccl {{
+                background: #fff3e0;
+                padding: 15px;
+                margin: 20px;
+                border-left: 4px solid #ff9800;
+                border-radius: 4px;
+            }}
+            .multinode-nccl h3 {{
+                color: #e65100;
+                margin-bottom: 10px;
+            }}
+            .nccl-item {{
+                font-size: 13px;
+                margin: 5px 0;
+                padding: 5px;
+                background: white;
+                border-radius: 4px;
+            }}
+            .legend {{
+                background: white;
+                padding: 15px;
+                border-radius: 8px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                margin: 20px;
+            }}
+            .legend-item {{
+                display: flex;
+                align-items: center;
+                margin: 8px 0;
+                font-size: 14px;
+            }}
+            .info-text {{
+                background: #e3f2fd;
+                padding: 10px;
+                margin: 20px;
+                border-left: 4px solid #2196f3;
+                border-radius: 4px;
+                font-size: 13px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🖥️ Network Topology - Server View</h1>
+                <p>Professional network visualization with server icons</p>
+            </div>
+
+            <div class="controls">
+                <button class="btn" onclick="resetView()">🔄 Reset View</button>
+                <button class="btn" onclick="cy.zoom(cy.zoom() * 1.2); cy.center()">🔍+ Zoom In</button>
+                <button class="btn" onclick="cy.zoom(cy.zoom() * 0.8); cy.center()">🔍- Zoom Out</button>
+                <button class="btn" onclick="fitToScreen()">📐 Fit to Screen</button>
+                <button class="btn" onclick="exportPNG()">📸 Export PNG</button>
+                <button class="btn" onclick="exportJSON()">💾 Export JSON</button>
+            </div>
+
+            <div class="info-text">
+                <strong>💡 Controls:</strong>
+                Scroll to zoom | Drag background to pan | <strong>Drag server icons to move</strong> |
+                Click server for details | <strong>Double-click canvas to reset zoom</strong> | <strong>Drag to box-select and zoom</strong>
+            </div>
+
+            <div style="position: relative;">
+                <div id="cy"></div>
+                <div id="info-panel" class="info-panel">
+                    <button class="close-btn" onclick="closeInfo()">✕</button>
+                    <div id="info-content"></div>
+                </div>
+            </div>
+
+            <div class="legend">
+                <h3 style="margin-bottom: 10px;">Legend</h3>
+                <div class="legend-item">
+                    <i class="fas fa-server" style="color: #667eea; font-size: 20px; margin-right: 10px;"></i>
+                    <span>Source server (center) - drag to reposition</span>
+                </div>
+                <div class="legend-item">
+                    <i class="fas fa-server" style="color: #2196f3; font-size: 20px; margin-right: 10px;"></i>
+                    <span>Target servers - drag to reposition</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 40px; height: 3px; background: #00c853; margin-right: 10px;"></div>
+                    <span>Individual NIC (Sequential) - High bandwidth (>80 Gb/s)</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 40px; height: 3px; background: #ffd600; margin-right: 10px;"></div>
+                    <span>Individual NIC (Sequential) - Medium bandwidth (40-80 Gb/s)</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 40px; height: 3px; background: #ff1744; margin-right: 10px;"></div>
+                    <span>Individual NIC (Sequential) - Low bandwidth (<40 Gb/s)</span>
+                </div>
+                <div class="legend-item">
+                    <div style="width: 40px; height: 3px; background: #ff9800; border-top: 3px dashed #ff9800; margin-right: 10px;"></div>
+                    <span><strong>ALL NICs (Parallel)</strong> - Combined throughput of all NICs</span>
+                </div>
+            </div>
+        </div>
+
+        <script>
+            const elements = {cy_data};
+            const multinodeNccl = {multinode_nccl_data};
+
+            const nicColors = ['#2196f3', '#ff9800', '#9c27b0', '#4caf50', '#e91e63', '#00bcd4'];
+
+            // Convert NIC speed from Mb/s to Gb/s
+            function formatNicSpeed(speed) {{
+                if (speed === 'Unknown') return 'Unknown';
+                const match = speed.match(/(\d+)Mb\/s/);
+                if (match) {{
+                    const mbps = parseInt(match[1]);
+                    const gbps = mbps / 1000;
+                    return `${{speed}} (${{gbps}} Gb/s)`;
+                }}
+                return speed;
+            }}
+
+            function formatBreakdown(nicsJson, total) {{
+                if (!nicsJson || nicsJson === '{{}}') {{
+                    return `<strong>Total Bandwidth:</strong> ${{total.toFixed(2)}} Gb/s`;
+                }}
+
+                try {{
+                    const nics = JSON.parse(nicsJson);
+                    const nicEntries = Object.entries(nics);
+
+                    if (nicEntries.length === 0) {{
+                        return `<strong>Total Bandwidth:</strong> ${{total.toFixed(2)}} Gb/s`;
+                    }}
+
+                    const parts = nicEntries.map(([nic, bw]) => `${{bw.toFixed(2)}}G (${{nic}})`);
+                    const breakdown = parts.join(' + ');
+                    return `<strong>Breakdown:</strong> ${{breakdown}} = ${{total.toFixed(2)}} Gb/s`;
+                }} catch (e) {{
+                    return `<strong>Total Bandwidth:</strong> ${{total.toFixed(2)}} Gb/s`;
+                }}
+            }}
+
+            // Server rack icon with WHITE background
+            function createServerIcon(color, isSource) {{
+                const size = isSource ? 80 : 60;
+                const svg = `
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="${{size}}" height="${{size}}">
+                        <!-- White background to prevent black showing through -->
+                        <rect x="0" y="0" width="24" height="24" fill="white" rx="2"/>
+
+                        <!-- Server rack units -->
+                        <rect x="2" y="3" width="20" height="6" rx="1.5" fill="${{color}}" stroke="white" stroke-width="0.3"/>
+                        <rect x="2" y="10" width="20" height="6" rx="1.5" fill="${{color}}" stroke="white" stroke-width="0.3"/>
+                        <rect x="2" y="17" width="20" height="4" rx="1.5" fill="${{color}}" stroke="white" stroke-width="0.3"/>
+
+                        <!-- Status LEDs -->
+                        <circle cx="5" cy="6" r="0.8" fill="#4caf50"/>
+                        <circle cx="7" cy="6" r="0.8" fill="#ffd600"/>
+                        <circle cx="5" cy="13" r="0.8" fill="#4caf50"/>
+                        <circle cx="7" cy="13" r="0.8" fill="#4caf50"/>
+                        <circle cx="5" cy="19" r="0.6" fill="#4caf50"/>
+
+                        <!-- Drive bays -->
+                        <rect x="10" y="5" width="8" height="2" rx="0.4" fill="white" opacity="0.5"/>
+                        <rect x="10" y="12" width="8" height="2" rx="0.4" fill="white" opacity="0.5"/>
+                        <rect x="10" y="18" width="6" height="1.5" rx="0.4" fill="white" opacity="0.5"/>
+                    </svg>
+                `;
+                return 'data:image/svg+xml;base64,' + btoa(svg);
+            }}
+
+            const cy = cytoscape({{
+                container: document.getElementById('cy'),
+                elements: elements,
+                style: [
+                    {{
+                        selector: 'node',
+                        style: {{
+                            'shape': 'rectangle',
+                            'background-image': ele => createServerIcon('#2196f3', false),
+                            'background-fit': 'contain',
+                            'background-clip': 'none',
+                            'background-color': 'transparent',
+                            'label': 'data(label)',
+                            'width': 80,
+                            'height': 80,
+                            'font-size': 11,
+                            'text-valign': 'bottom',
+                            'text-halign': 'center',
+                            'text-margin-y': 5,
+                            'color': '#333',
+                            'font-weight': 'bold',
+                            'overlay-opacity': 0,
+                            'border-width': 0,
+                            'text-wrap': 'wrap',
+                            'text-max-width': 140
+                        }}
+                    }},
+                    {{
+                        selector: 'node[type="source"]',
+                        style: {{
+                            'background-image': ele => createServerIcon('#667eea', true),
+                            'width': 100,
+                            'height': 100,
+                            'font-size': 12
+                        }}
+                    }},
+                    {{
+                        selector: 'node:selected',
+                        style: {{
+                            'border-width': 3,
+                            'border-color': '#ff9800',
+                            'border-opacity': 1
+                        }}
+                    }},
+                    {{
+                        selector: 'edge',
+                        style: {{
+                            'width': 'mapData(bandwidth, 0, 100, 2, 8)',
+                            'line-color': ele => {{
+                                const bw = ele.data('bandwidth');
+                                if (bw > 80) return '#00c853';
+                                if (bw > 40) return '#ffd600';
+                                return '#ff1744';
+                            }},
+                            'target-arrow-color': ele => {{
+                                const nicIdx = ele.data('nicIndex');
+                                return nicColors[nicIdx % nicColors.length];
+                            }},
+                            'target-arrow-shape': 'triangle',
+                            'curve-style': 'bezier',
+                            'label': 'data(label)',
+                            'font-size': 16,
+                            'text-rotation': 'autorotate',
+                            'text-margin-y': -10,
+                            'color': '#333',
+                            'font-weight': 'bold',
+                            'opacity': 0.8
+                        }}
+                    }},
+                    {{
+                        selector: 'edge:selected',
+                        style: {{
+                            'width': 'mapData(bandwidth, 0, 100, 4, 12)',
+                            'opacity': 1
+                        }}
+                    }},
+                    {{
+                        selector: 'edge[edgeType="aggregate"]',
+                        style: {{
+                            'line-style': 'dashed',
+                            'line-dash-pattern': [10, 5],
+                            'width': 6,
+                            'line-color': '#ff9800',
+                            'target-arrow-color': '#ff9800',
+                            'font-size': 16,
+                            'font-weight': 'bold',
+                            'color': '#333'
+                        }}
+                    }}
+                ],
+                layout: {{
+                    name: 'circle',
+                    radius: 300,
+                    startAngle: -Math.PI / 2,
+                    animate: true,
+                    animationDuration: 500
+                }},
+                wheelSensitivity: 0.2,
+                minZoom: 0.1,
+                maxZoom: 5,
+                // Enable box selection WITHOUT requiring Shift key
+                boxSelectionEnabled: true,
+                selectionType: 'additive'
+            }});
+
+            // Click node to show info
+            cy.on('tap', 'node', function(evt) {{
+                const node = evt.target;
+                const data = node.data();
+                const nics = JSON.parse(data.nics);
+                const ncclData = JSON.parse(data.nccl);
+
+                let html = `
+                    <h3><i class="fas fa-server"></i> ${{data.label}}</h3>
+                    <div class="info-item"><strong>CPU:</strong> ${{data.cpu}} (${{data.cores}} cores)</div>
+                    <div class="info-item"><strong>GPU:</strong> ${{data.gpu}}</div>
+                    <div class="info-item"><strong>eth0:</strong> ${{data.eth0}}</div>
+                    <h4 style="margin-top: 15px; color: #667eea;">Network Interfaces</h4>
+                `;
+
+                nics.forEach((nic, idx) => {{
+                    const color = nicColors[idx % nicColors.length];
+                    html += `
+                        <div class="info-item" style="border-left: 4px solid ${{color}};">
+                            <strong>${{nic.name}}</strong><br>
+                            Speed: ${{formatNicSpeed(nic.speed)}}<br>
+                            IP: ${{nic.ip}}<br>
+                            Routes: ${{nic.routes}}<br>
+                            Model: ${{nic.model}}
+                        </div>
+                    `;
+                }});
+
+                // Add Local NCCL Performance section
+                html += `<h4 style="margin-top: 15px; color: #667eea;">Local NCCL Performance</h4>`;
+
+                if (ncclData.all_reduce > 0 || ncclData.all_gather > 0 || ncclData.reduce_scatter > 0 || ncclData.broadcast > 0) {{
+                    html += `
+                        <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800;">
+                            <strong>all_reduce:</strong> ${{ncclData.all_reduce.toFixed(2)}} GB/s<br>
+                            <strong>all_gather:</strong> ${{ncclData.all_gather.toFixed(2)}} GB/s<br>
+                            <strong>reduce_scatter:</strong> ${{ncclData.reduce_scatter.toFixed(2)}} GB/s<br>
+                            <strong>broadcast:</strong> ${{ncclData.broadcast.toFixed(2)}} GB/s
+                        </div>
+                    `;
+                }} else {{
+                    html += `<div class="info-item"><em>No local NCCL data available</em></div>`;
+                }}
+
+                document.getElementById('info-content').innerHTML = html;
+                document.getElementById('info-panel').classList.add('visible');
+            }});
+
+            // Click edge to show connection details
+            cy.on('tap', 'edge', function(evt) {{
+                const edge = evt.target;
+                const data = edge.data();
+                let html = '';
+
+                if (data.edgeType === 'individual') {{
+                    // Individual NIC - show sequential data only
+                    html = `
+                        <h3><i class="fas fa-network-wired"></i> ${{data.nic}} Connection</h3>
+                        <div class="info-item">
+                            <strong>Source:</strong> ${{data.source}}<br>
+                            <strong>Target:</strong> ${{data.target}}<br>
+                            <strong>Type:</strong> Individual NIC (Sequential)<br>
+                            <strong>Auto-negotiated Speed:</strong> ${{formatNicSpeed(data.nic_speed)}}
+                        </div>
+
+                        <h4 style="margin-top: 15px; color: #667eea;">
+                            <i class="fas fa-chart-line"></i> TCP Sequential Performance
+                        </h4>
+                        <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                            <strong>Bandwidth:</strong> ${{data.tcp_seq.toFixed(2)}} Gb/s
+                        </div>
+
+                        <h4 style="margin-top: 15px; color: #667eea;">
+                            <i class="fas fa-bolt"></i> RDMA (RoCE) Sequential Performance
+                        </h4>
+                        <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                            <strong>Bandwidth:</strong> ${{data.roce_seq.toFixed(2)}} Gb/s
+                        </div>
+
+                        <h4 style="margin-top: 15px; color: #667eea;">
+                            <i class="fas fa-microchip"></i> RoCE+CUDA (GPUDirect) Sequential
+                        </h4>
+                        <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                            <strong>Bandwidth:</strong> ${{data.cuda_seq.toFixed(2)}} Gb/s
+                        </div>
+                    `;
+                }} else {{
+                    // Aggregate - show parallel data (sum of all NICs)
+                    html = `
+                        <h3><i class="fas fa-project-diagram"></i> Aggregate Connection</h3>
+                        <div class="info-item">
+                            <strong>Source:</strong> ${{data.source}}<br>
+                            <strong>Target:</strong> ${{data.target}}<br>
+                            <strong>Type:</strong> All NICs Combined (Parallel)
+                        </div>
+
+                        <h4 style="margin-top: 15px; color: #667eea;">
+                            <i class="fas fa-chart-line"></i> TCP Parallel Performance
+                        </h4>
+                        <div class="info-item" style="background: #e3f2fd; border-left: 4px solid #2196f3;">
+                            ${{formatBreakdown(data.tcp_par_nics, data.tcp_par)}}
+                        </div>
+
+                        <h4 style="margin-top: 15px; color: #667eea;">
+                            <i class="fas fa-bolt"></i> RDMA (RoCE) Parallel Performance
+                        </h4>
+                        <div class="info-item" style="background: #f3e5f5; border-left: 4px solid #9c27b0;">
+                            ${{formatBreakdown(data.roce_par_nics, data.roce_par)}}
+                        </div>
+
+                        <h4 style="margin-top: 15px; color: #667eea;">
+                            <i class="fas fa-microchip"></i> RoCE+CUDA (GPUDirect) Parallel
+                        </h4>
+                        <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                            ${{formatBreakdown(data.cuda_par_nics, data.cuda_par)}}
+                        </div>
+
+                        <div class="info-item" style="background: #fff3e0; border-left: 4px solid #ff9800; margin-top: 15px;">
+                            <i class="fas fa-info-circle"></i>
+                            <strong>Note:</strong> Parallel tests use all NICs simultaneously, so this represents the combined throughput.
+                        </div>
+                    `;
+
+                    // Add Multi-Node NCCL Performance section to aggregate line
+                    if (multinodeNccl.length > 0) {{
+                        html += `<h4 style="margin-top: 15px; color: #667eea;"><i class="fas fa-network-wired"></i> Multi-Node NCCL Performance</h4>`;
+                        multinodeNccl.forEach(result => {{
+                            html += `
+                                <div class="info-item" style="background: #e8f5e9; border-left: 4px solid #4caf50;">
+                                    <strong>${{result.size}}:</strong> ${{result.bandwidth.toFixed(2)}} Gb/s
+                                    <span style="color: #4caf50;">✓ ${{result.status}}</span>
+                                </div>
+                            `;
+                        }});
+                    }}
+                }}
+
+                document.getElementById('info-content').innerHTML = html;
+                document.getElementById('info-panel').classList.add('visible');
+            }});
+
+            // Double-click on canvas (background) to reset zoom and fit
+            cy.on('dbltap', function(evt) {{
+                // Only reset if clicked on background, not on a node or edge
+                if (evt.target === cy) {{
+                    cy.fit();
+                    cy.center();
+                }}
+            }});
+
+            // Box selection zoom: when nodes are selected via box-select, zoom to fit them
+            cy.on('boxend', function(evt) {{
+                const selectedNodes = cy.$(':selected');
+                if (selectedNodes.length > 0) {{
+                    cy.fit(selectedNodes, 50); // Fit with 50px padding
+                    // Deselect after zoom
+                    setTimeout(() => selectedNodes.unselect(), 500);
+                }}
+            }});
+
+            function closeInfo() {{
+                document.getElementById('info-panel').classList.remove('visible');
+            }}
+
+            function resetView() {{
+                cy.layout({{
+                    name: 'circle',
+                    radius: 300,
+                    startAngle: -Math.PI / 2,
+                    animate: true,
+                    animationDuration: 500
+                }}).run();
+                cy.fit();
+            }}
+
+            function fitToScreen() {{
+                cy.fit();
+            }}
+
+            function exportPNG() {{
+                const png = cy.png({{
+                    output: 'blob',
+                    bg: '#fafafa',
+                    full: true,
+                    scale: 4
+                }});
+
+                const url = URL.createObjectURL(png);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'network-topology-servers.png';
+                link.click();
+                URL.revokeObjectURL(url);
+            }}
+
+            function exportJSON() {{
+                const json = cy.json();
+                const blob = new Blob([JSON.stringify(json, null, 2)], {{type: 'application/json'}});
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'network-topology.json';
+                link.click();
+                URL.revokeObjectURL(url);
+            }}
+
+            cy.ready(function() {{
+                cy.fit();
+            }});
+        </script>
+    </body>
+    </html>"""
+
+        return html
+
   generate-report.py: |
     #!/usr/bin/env python3
     import sys
     import os
     import parser
     import html_generator
+    import circular_topology
 
     def main():
         """Main function to generate the report"""
         # Collect data from logs
         data = parser.collect_all_data()
-        
+
         if not data:
             print("\nERROR: Failed to collect data from logs")
             sys.exit(1)
-        
-        # Generate HTML
+
+        # Generate HTML reports
         html = html_generator.generate_html(data)
-        
-        # Save to file
-        output_file = "/tmp/www/index.html"
-        os.makedirs("/tmp/www", exist_ok=True)
-        
-        with open(output_file, "w") as f:
+        circular_html = circular_topology.generate_circular_topology_html(data)
+
+        # Save to files
+        output_dir = "/tmp/www"
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Main report (with tables and old topology)
+        with open(f"{output_dir}/index.html", "w") as f:
             f.write(html)
-        
-        print(f"\n✓ HTML report generated successfully!")
-        print(f"  Output: {output_file}")
-        print(f"  Size: {len(html)} bytes")
+
+        # Circular topology visualization
+        with open(f"{output_dir}/topology.html", "w") as f:
+            f.write(circular_html)
+
+        # Create landing page with navigation
+        landing_html = f"""<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Network Performance Report</title>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+            body {{
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }}
+            .container {{
+                max-width: 900px;
+                background: white;
+                border-radius: 12px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+                overflow: hidden;
+            }}
+            .header {{
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                padding: 40px;
+                text-align: center;
+            }}
+            .header h1 {{ font-size: 2.5em; margin-bottom: 10px; }}
+            .content {{ padding: 40px; }}
+            .card-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+                gap: 20px;
+                margin-top: 20px;
+            }}
+            .card {{
+                background: #f8f9fa;
+                padding: 30px;
+                border-radius: 10px;
+                text-align: center;
+                transition: transform 0.2s, box-shadow 0.2s;
+                cursor: pointer;
+                text-decoration: none;
+                color: inherit;
+                display: block;
+            }}
+            .card:hover {{
+                transform: translateY(-5px);
+                box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3);
+            }}
+            .card-icon {{
+                font-size: 3em;
+                margin-bottom: 15px;
+            }}
+            .card h2 {{
+                color: #667eea;
+                margin-bottom: 10px;
+                font-size: 1.5em;
+            }}
+            .card p {{
+                color: #666;
+                line-height: 1.6;
+            }}
+            .stats {{
+                background: #e3f2fd;
+                padding: 20px;
+                border-radius: 8px;
+                margin: 20px 0;
+            }}
+            .stats-grid {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+                gap: 15px;
+                margin-top: 15px;
+            }}
+            .stat-item {{
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 2em;
+                font-weight: bold;
+                color: #667eea;
+            }}
+            .stat-label {{
+                color: #666;
+                font-size: 0.9em;
+                margin-top: 5px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🚀 Network Performance Report</h1>
+                <p>Comprehensive RDMA, TCP, and NCCL Analysis</p>
+            </div>
+
+            <div class="content">
+                <div class="stats">
+                    <h3 style="color: #667eea; margin-bottom: 15px;">Test Summary</h3>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <div class="stat-value">{len(data['workers'])}</div>
+                            <div class="stat-label">Worker Nodes</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">{len(data['nics'])}</div>
+                            <div class="stat-label">SR-IOV NICs</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">{len(data['rdma_results'])}</div>
+                            <div class="stat-label">RDMA Tests</div>
+                        </div>
+                        <div class="stat-item">
+                            <div class="stat-value">{len(data['nccl_results'])}</div>
+                            <div class="stat-label">NCCL Tests</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card-grid">
+                    <a href="topology.html" class="card">
+                        <div class="card-icon">🔗</div>
+                        <h2>Circular Topology</h2>
+                        <p>Interactive network visualization with zoom, pan, and export capabilities</p>
+                    </a>
+
+                    <a href="details.html" class="card">
+                        <div class="card-icon">📊</div>
+                        <h2>Detailed Results</h2>
+                        <p>Performance tables, hardware specs, and comprehensive test results</p>
+                    </a>
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>"""
+
+        with open(f"{output_dir}/landing.html", "w") as f:
+            f.write(landing_html)
+
+        # Rename detailed report
+        os.rename(f"{output_dir}/index.html", f"{output_dir}/details.html")
+
+        # Make landing page the index
+        with open(f"{output_dir}/index.html", "w") as f:
+            f.write(landing_html)
+
+        print(f"\n✓ HTML reports generated successfully!")
+        print(f"  Landing page: {output_dir}/index.html")
+        print(f"  Circular topology: {output_dir}/topology.html")
+        print(f"  Detailed results: {output_dir}/details.html")
+        print(f"  Total size: {len(html) + len(circular_html) + len(landing_html)} bytes")
 
     if __name__ == "__main__":
         main()
