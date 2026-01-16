@@ -434,10 +434,10 @@ data:
         tcp_results = data['tcp_results']
         nccl_results = data['nccl_results']
     
-        # Assuming 2 workers for the topology (extend this later for N workers)
+        # Support for N workers
         worker1 = workers[0] if len(workers) > 0 else 'worker-1'
         worker2 = workers[1] if len(workers) > 1 else 'worker-2'
-    
+
         worker1_ips = worker_ips.get(worker1, {})
         worker2_ips = worker_ips.get(worker2, {})
         worker1_routes = worker_routes.get(worker1, {})
@@ -460,7 +460,7 @@ data:
     
                 {generate_hardware_specs(hw)}
 
-                {generate_worker_results(worker1, worker2, nics, rdma_results, tcp_results, nccl_results, rdma_agg, tcp_agg)}
+                {generate_worker_results(workers, nics, rdma_results, tcp_results, nccl_results, rdma_agg, tcp_agg)}
     
                 {generate_command_reference()}
             </div>
@@ -867,7 +867,7 @@ data:
                 </div>"""
 
 
-    def generate_worker_results(worker1, worker2, nics, rdma_results, tcp_results, nccl_results, rdma_agg, tcp_agg):
+    def generate_worker_results(workers, nics, rdma_results, tcp_results, nccl_results, rdma_agg, tcp_agg):
         """Generate per-worker performance results"""
 
         def get_worker_nccl(worker):
@@ -902,18 +902,24 @@ data:
                         </tbody>
                     </table>"""
 
-        def generate_worker_section(worker, is_source):
+        def generate_worker_section(worker, other_workers):
             """Generate performance section for one worker"""
-            other_worker = worker2 if is_source else worker1
-            direction = f"{worker} → {other_worker}"
+            # For each worker, show its outbound performance to all other workers
+            # If only 2 workers total, show direction; otherwise show all targets
+
+            # Determine direction text
+            if len(other_workers) == 1:
+                direction = f"{worker} → {other_workers[0]}"
+            else:
+                direction = f"{worker} → {', '.join(other_workers)}"
 
             # RDMA Performance
             rdma_rows = ""
             for nic in nics:
-                roce_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_seq') if is_source else 0
-                roce_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_par') if is_source else 0
-                cuda_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_seq') if is_source else 0
-                cuda_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_par') if is_source else 0
+                roce_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_seq')
+                roce_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_par')
+                cuda_seq = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_seq')
+                cuda_par = get_rdma_by_nic(rdma_results, nic, 'RoCE_CUDA_par')
 
                 if roce_seq > 0 or roce_par > 0:
                     rdma_rows += f"""
@@ -926,8 +932,8 @@ data:
                                     <td><span class="metric {get_metric_class(cuda_par, 80, 50)}">{cuda_par:.2f} Gb/s</span></td>
                                 </tr>"""
 
-            # Add aggregate row for source
-            if is_source and rdma_rows:
+            # Add aggregate row
+            if rdma_rows:
                 rdma_rows += f"""
                                 <tr style="background:#f0f0ff; font-weight:bold;">
                                     <td colspan="2" style="text-align:center;">Aggregate:</td>
@@ -962,7 +968,7 @@ data:
             # TCP Performance
             tcp_rows = ""
             for nic in nics:
-                tcp_result = get_tcp_by_nic(tcp_results, nic) if is_source else {'tcp_seq': 0, 'tcp_par': 0}
+                tcp_result = get_tcp_by_nic(tcp_results, nic)
                 tcp_seq = tcp_result.get('tcp_seq', 0)
                 tcp_par = tcp_result.get('tcp_par', 0)
 
@@ -975,8 +981,8 @@ data:
                                     <td><span class="metric {get_metric_class(tcp_par, 80, 50)}">{tcp_par:.2f} Gb/s</span></td>
                                 </tr>"""
 
-            # Add aggregate row for source
-            if is_source and tcp_rows:
+            # Add aggregate row
+            if tcp_rows:
                 tcp_rows += f"""
                                 <tr style="background:#f0f0ff; font-weight:bold;">
                                     <td colspan="2" style="text-align:center;">Aggregate:</td>
@@ -1013,8 +1019,14 @@ data:
     {nccl_table}
                 </div>"""
 
-        # Generate sections for both workers
-        return generate_worker_section(worker1, True) + generate_worker_section(worker2, False)
+        # Generate sections for all workers
+        all_sections = ""
+        for worker in workers:
+            # Get list of other workers (all workers except current one)
+            other_workers = [w for w in workers if w != worker]
+            all_sections += generate_worker_section(worker, other_workers)
+
+        return all_sections
 
 
     def generate_rdma_table(rdma_results, rdma_agg, worker1, worker2, nics):
