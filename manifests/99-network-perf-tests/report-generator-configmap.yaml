@@ -2046,10 +2046,11 @@ data:
                 // Hide info panel before exporting to avoid blocking the view
                 const infoPanel = document.getElementById('info-panel');
                 const wasPanelVisible = infoPanel.classList.contains('visible');
+                const originalDisplay = infoPanel.style.display;
 
-                if (wasPanelVisible) {{
-                    infoPanel.classList.remove('visible');
-                }}
+                // Force hide with inline style (overrides everything)
+                infoPanel.classList.remove('visible');
+                infoPanel.style.display = 'none';
 
                 // Small delay to ensure DOM is updated
                 setTimeout(() => {{
@@ -2063,10 +2064,11 @@ data:
                     link.click();
                     URL.revokeObjectURL(url);
 
-                    // Restore panel visibility if it was visible
+                    // Restore panel state
                     if (wasPanelVisible) {{
                         infoPanel.classList.add('visible');
                     }}
+                    infoPanel.style.display = originalDisplay;
                 }}, 100);
             }}
 
