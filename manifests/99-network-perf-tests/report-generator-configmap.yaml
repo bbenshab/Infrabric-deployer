@@ -459,9 +459,7 @@ data:
                 {generate_stats_overview(len(workers), len(nics), hw)}
     
                 {generate_hardware_specs(hw)}
-    
-                {generate_topology_svg(worker1, worker2, worker1_ips, worker2_ips, nics, rdma_results, tcp_results, nccl_results, worker1_routes, worker2_routes)}
-    
+
                 {generate_rdma_table(rdma_results, rdma_agg, worker1, worker2, nics)}
     
                 {generate_tcp_table(tcp_results, tcp_agg, worker1, worker2, nics)}
