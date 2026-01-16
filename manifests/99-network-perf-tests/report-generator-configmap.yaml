@@ -1409,6 +1409,7 @@ data:
                 <button class="btn" onclick="fitToScreen()">📐 Fit to Screen</button>
                 <button class="btn" onclick="exportPNG()">📸 Export PNG</button>
                 <button class="btn" onclick="exportJSON()">💾 Export JSON</button>
+                <button class="btn" onclick="exportHTML()">📄 Export HTML</button>
             </div>
 
             <div class="info-text">
@@ -1881,6 +1882,18 @@ data:
                 const link = document.createElement('a');
                 link.href = url;
                 link.download = 'network-topology.json';
+                link.click();
+                URL.revokeObjectURL(url);
+            }}
+
+            function exportHTML() {{
+                // Get the complete HTML document
+                const htmlContent = document.documentElement.outerHTML;
+                const blob = new Blob([htmlContent], {{type: 'text/html'}});
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'network-topology-complete.html';
                 link.click();
                 URL.revokeObjectURL(url);
             }}
