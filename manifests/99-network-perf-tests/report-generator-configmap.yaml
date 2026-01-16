@@ -2058,8 +2058,10 @@ data:
                 // Hide info panel in the clone
                 const infoPanelClone = docClone.querySelector('#info-panel');
                 if (infoPanelClone) {{
+                    // Remove visible class (CSS already has display:none as default)
                     infoPanelClone.classList.remove('visible');
-                    infoPanelClone.style.display = 'none';
+                    // Clear any inline styles that might have been added
+                    infoPanelClone.removeAttribute('style');
                     // Also clear its content
                     const infoContentClone = infoPanelClone.querySelector('#info-content');
                     if (infoContentClone) {{
