@@ -1885,15 +1885,31 @@ data:
             }}
 
             function exportHTML() {{
-                // Get the complete HTML document
-                const htmlContent = document.documentElement.outerHTML;
-                const blob = new Blob([htmlContent], {{type: 'text/html'}});
-                const url = URL.createObjectURL(blob);
-                const link = document.createElement('a');
-                link.href = url;
-                link.download = 'network-topology-complete.html';
-                link.click();
-                URL.revokeObjectURL(url);
+                // Hide info panel before exporting to avoid blocking the view
+                const infoPanel = document.getElementById('info-panel');
+                const wasPanelVisible = infoPanel.classList.contains('visible');
+
+                if (wasPanelVisible) {{
+                    infoPanel.classList.remove('visible');
+                }}
+
+                // Small delay to ensure DOM is updated
+                setTimeout(() => {{
+                    // Get the complete HTML document
+                    const htmlContent = document.documentElement.outerHTML;
+                    const blob = new Blob([htmlContent], {{type: 'text/html'}});
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = 'network-topology-complete.html';
+                    link.click();
+                    URL.revokeObjectURL(url);
+
+                    // Restore panel visibility if it was visible
+                    if (wasPanelVisible) {{
+                        infoPanel.classList.add('visible');
+                    }}
+                }}, 100);
             }}
 
             cy.ready(function() {{
